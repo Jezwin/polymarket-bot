@@ -1,9 +1,10 @@
 import type { ClobClientService } from "./clobClient.js";
-import { logger } from "../utils/logger.js";
+import { logger, fillsLogger } from "../utils/logger.js";
 import { Side } from "@polymarket/clob-client";
 import WebSocket from "ws";
 import { env } from "../config/env.js";
 import type { PolygonWsClient } from "./polygonWsClient.js";
+import { notify } from "../utils/notify.js";
 
 export type PlaceSellFn = (tokenId: string, price: number, size: number) => Promise<void>;
 
@@ -166,14 +167,31 @@ export class FillListener {
         console.log(`\n===========================================`);
         console.log(`💰 ${tracked.side} ORDER FILL DETECTED (WS)!`);
         console.log(`Token: ${tokenId} | Fill Size: ${fillSize}`);
-        console.log(`Progress: ${tracked.matchedSize.toFixed(2)} / ${tracked.targetSize} Shares`);
-        console.log(`===========================================\n`);
+        fillsLogger.info(
+          { 
+            orderId, 
+            tokenId, 
+            fillSize, 
+            matchedSize: tracked.matchedSize, 
+            targetSize: tracked.targetSize, 
+            side: tracked.side,
+            isFullyFilled: tracked.matchedSize >= tracked.targetSize
+          },
+          `Order ${tracked.matchedSize >= tracked.targetSize ? 'Fully' : 'Partially'} Filled: ${tracked.side} | Progress: ${tracked.matchedSize.toFixed(2)} / ${tracked.targetSize} Shares`
+        );
 
         const isFullyFilled = tracked.matchedSize >= tracked.targetSize;
+        const emoji = tracked.side === Side.BUY ? "🟢" : "🔴";
+        
+        void notify(
+          `${isFullyFilled ? "Fully" : "Partially"} Filled: ${tracked.side} ${emoji}`,
+          `Token: ${tokenId}\nFilled: ${fillSize}\nProgress: ${tracked.matchedSize.toFixed(2)} / ${tracked.targetSize}`,
+          ["zap", isFullyFilled ? "check" : "hourglass"]
+        );
 
         // trigger sell at 0.20 if it was a buy order that completely filled
         if (tracked.side === Side.BUY && isFullyFilled) {
-            const SELL_PRICE = 0.20;
+            const SELL_PRICE = 0.08;
             const SELL_SIZE = Math.floor(tracked.targetSize);
 
             // Note: handleFill is synchronous but we can fire and forget an async operation for the sell flow
@@ -216,7 +234,6 @@ export class FillListener {
         }
 
         if (isFullyFilled) {
-            fetch('https://ntfy.sh/polymarketOrderFill', { method: 'POST', body: 'Order filled' }).catch(console.error);
             this.activeOrders.delete(orderId);
             logger.info({ orderId }, "Tracking removed (Order Closed/Filled via WS)");
             console.log("Order fully filled, removed from WS tracking\n");

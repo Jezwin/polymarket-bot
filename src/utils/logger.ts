@@ -43,3 +43,34 @@ export const logger = pino({
 });
 
 logger.info({ logFilePath }, "Logging to file");
+
+const fillsLogFilePath = path.join(logsDir, `fills-${today}.log`);
+
+export const fillsLogger = pino({
+  level: "info",
+  base: {
+    service: "order-fills",
+  },
+  timestamp: pino.stdTimeFunctions.isoTime,
+  transport: {
+    targets: [
+      {
+        target: "pino-pretty",
+        level: "info",
+        options: {
+          colorize: true,
+          ignore: "pid,hostname,service",
+          translateTime: "UTC:yyyy-mm-dd'T'HH:MM:ss.l'Z'",
+        },
+      },
+      {
+        target: "pino/file",
+        level: "info",
+        options: {
+          destination: fillsLogFilePath,
+          mkdir: true,
+        },
+      },
+    ],
+  },
+});

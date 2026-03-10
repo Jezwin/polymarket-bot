@@ -8,6 +8,7 @@ import { toUtcMillis } from "../utils/time.js";
 import { ClobClientService } from "./clobClient.js";
 import type { FillListener } from "./fillListener.js";
 import type { MarketDiscoveryService } from "./marketDiscovery.js";
+import { notify } from "../utils/notify.js";
 
 interface DesiredOrder {
   leg: MarketLeg;
@@ -285,6 +286,12 @@ export class OrderService {
           },
           "Limit order placed",
         );
+
+        void notify(
+          "BUY Limit Order Placed 🟢",
+          `Market: ${market.symbol}\nLeg: ${desired.leg}\nPrice: $${env.ORDER_PRICE}\nSize: ${env.ORDER_SIZE} shares\nTime: ${market.startTime}`,
+          ["green_circle"]
+        );
       } catch (error) {
         this.placementKeys.delete(placementKey);
         logger.error(
@@ -301,7 +308,11 @@ export class OrderService {
     }
 
     if (trackedOrders.length === 0) {
-      throw new Error(`No orders placed or reused for market ${market.marketId}`);
+      logger.info(
+        { marketId: market.marketId, conditionId: market.conditionId },
+        "All legs already placed or skipped for market",
+      );
+      return trackedOrders;
     }
 
     for (const order of trackedOrders) {
@@ -380,6 +391,12 @@ export class OrderService {
     logger.info(
       { orderId, tokenId, price, size },
       "Sell limit order placed successfully",
+    );
+
+    void notify(
+      "SELL Limit Order Placed 🔴",
+      `Token: ${tokenId}\nPrice: $${price}\nSize: ${size} shares\nOrder ID: ${orderId.slice(0, 8)}...`,
+      ["red_circle"]
     );
 
     console.log(`\n===========================================`);
