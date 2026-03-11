@@ -1,6 +1,7 @@
 import { env } from "../config/env.js";
 import { MarketDiscoveryService } from "../services/marketDiscovery.js";
 import { OrderService } from "../services/orderService.js";
+import type { PositionManager } from "../services/positionManager.js";
 import type { CryptoSymbol, DiscoveredMarket } from "../types/market.js";
 import { logger } from "../utils/logger.js";
 import { floorToFiveMinuteBucketUtc, floorToFifteenMinuteBucketUtc, formatIso, toUtcMillis } from "../utils/time.js";
@@ -26,6 +27,7 @@ export class OrderScheduler {
   constructor(
     private readonly marketDiscoveryService: MarketDiscoveryService,
     private readonly orderService: OrderService,
+    private readonly positionManager?: PositionManager,
   ) { }
 
   async start(): Promise<void> {
@@ -77,6 +79,7 @@ export class OrderScheduler {
 
       await this.process5mCycle(discoveredMarkets, now);
       await this.process15mCycle(discoveredMarkets, now);
+      await this.positionManager?.manageOpenExits(now);
     } catch (error) {
       logger.error(
         {
@@ -126,7 +129,7 @@ export class OrderScheduler {
     );
 
     if (unplacedMarkets.length > 0) {
-      logger.info(
+      logger.debug?.(
         {
           targetStartTimeIso: formatIso(targetStartTimeMs),
           unplacedCount: unplacedMarkets.length,
@@ -136,8 +139,27 @@ export class OrderScheduler {
 
       for (const market of unplacedMarkets) {
         try {
-          await this.orderService.placeOrdersForMarket(market);
-          this.cyclePlacedMarkets.add(market.conditionId);
+          const placementResult = await this.orderService.placeOrdersForMarket(market);
+          const failedLegs = placementResult.legs.filter((leg) => leg.status === "failed");
+
+          if (failedLegs.length === 0) {
+            this.cyclePlacedMarkets.add(market.conditionId);
+          } else {
+            logger.warn(
+              {
+                marketId: market.marketId,
+                conditionId: market.conditionId,
+                successfulLegs: placementResult.legs
+                  .filter((leg) => leg.status !== "failed")
+                  .map((leg) => ({ leg: leg.leg, status: leg.status })),
+                failedLegs: failedLegs.map((leg) => ({
+                  leg: leg.leg,
+                  reason: leg.reason,
+                })),
+              },
+              "Market placement incomplete; will retry failed legs on next tick",
+            );
+          }
         } catch (error) {
           logger.error(
             {
@@ -164,6 +186,10 @@ export class OrderScheduler {
     const selectedBySymbol = new Map<CryptoSymbol, DiscoveredMarket>();
 
     for (const market of discoveredMarkets) {
+      if (market.recurrence !== "5m") {
+        continue;
+      }
+
       if (floorToFiveMinuteBucketUtc(toUtcMillis(market.startTime)) !== targetStartTimeMs) {
         continue;
       }
@@ -245,7 +271,7 @@ export class OrderScheduler {
     );
 
     if (unplacedMarkets.length > 0) {
-      logger.info(
+      logger.debug?.(
         {
           label: "15m",
           targetStartTimeIso: formatIso(targetStartTimeMs),
@@ -256,8 +282,28 @@ export class OrderScheduler {
 
       for (const market of unplacedMarkets) {
         try {
-          await this.orderService.placeOrdersForMarket(market);
-          this.cycle15mPlacedMarkets.add(market.conditionId);
+          const placementResult = await this.orderService.placeOrdersForMarket(market);
+          const failedLegs = placementResult.legs.filter((leg) => leg.status === "failed");
+
+          if (failedLegs.length === 0) {
+            this.cycle15mPlacedMarkets.add(market.conditionId);
+          } else {
+            logger.warn(
+              {
+                label: "15m",
+                marketId: market.marketId,
+                conditionId: market.conditionId,
+                successfulLegs: placementResult.legs
+                  .filter((leg) => leg.status !== "failed")
+                  .map((leg) => ({ leg: leg.leg, status: leg.status })),
+                failedLegs: failedLegs.map((leg) => ({
+                  leg: leg.leg,
+                  reason: leg.reason,
+                })),
+              },
+              "15m market placement incomplete; will retry failed legs on next tick",
+            );
+          }
         } catch (error) {
           logger.error(
             {

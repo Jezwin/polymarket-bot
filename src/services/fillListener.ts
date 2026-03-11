@@ -1,12 +1,9 @@
-import type { ClobClientService } from "./clobClient.js";
 import { logger, fillsLogger } from "../utils/logger.js";
 import { Side } from "@polymarket/clob-client";
 import WebSocket from "ws";
 import { env } from "../config/env.js";
-import type { PolygonWsClient } from "./polygonWsClient.js";
+import type { PositionManager } from "./positionManager.js";
 import { notify } from "../utils/notify.js";
-
-export type PlaceSellFn = (tokenId: string, price: number, size: number) => Promise<void>;
 
 interface TrackedOrder {
     orderId: string;
@@ -22,16 +19,10 @@ export class FillListener {
     private isConnected = false;
     private ws: WebSocket | null = null;
     private activeOrders = new Map<string, TrackedOrder>();
-    private clobClientService: ClobClientService | null = null; // Kept for interface compatibility
 
     constructor(
-        private readonly placeSellFn: PlaceSellFn,
-        private readonly polygonWsClient: PolygonWsClient
+        private readonly positionManager: PositionManager
     ) { }
-
-    public setClobClient(clobClient: ClobClientService) {
-        this.clobClientService = clobClient;
-    }
 
     public async connect(): Promise<void> {
         if (this.isConnected) return;
@@ -85,23 +76,31 @@ export class FillListener {
         // Obsolete in user channel model
     }
 
-    public trackOrder(orderId: string, tokenId: string, size: number, side: Side) {
+    public trackOrder(orderId: string, tokenId: string, size: number, side: Side, matchedSize = 0) {
         if (this.activeOrders.has(orderId)) return;
 
         this.activeOrders.set(orderId, {
             orderId,
             tokenId,
             targetSize: size,
-            matchedSize: 0,
+            matchedSize,
             side
         });
 
-        logger.info({ orderId, tokenId, size, side }, "Added order to WS FillTracker");
+        logger.info({ orderId, tokenId, size, side, matchedSize }, "Added order to WS FillTracker");
     }
 
     private handleMessage(msg: any) {
         if (msg.event === "error" || msg.type === "error") {
-            logger.error({ msg }, "WS error message");
+            logger.error(
+              {
+                event: msg.event,
+                type: msg.type,
+                eventType: msg.event_type,
+                message: typeof msg.message === "string" ? msg.message : undefined,
+              },
+              "WS error message",
+            );
             return;
         }
 
@@ -120,53 +119,32 @@ export class FillListener {
         let orderId = "";
         let fillSize = 0;
 
-        // Extract orderId and fill size based on whether it's a trade match or order update
+        // Order updates are the canonical fill source because size_matched is cumulative.
         if (msg.event_type === "trade") {
-            const isTaker = this.activeOrders.has(msg.taker_order_id);
-            if (isTaker) {
-                orderId = msg.taker_order_id;
-                fillSize = Number(msg.size);
-            } else if (msg.maker_orders && Array.isArray(msg.maker_orders)) {
-                // If we were the maker, search through maker_orders
-                const makerOrder = msg.maker_orders.find((m: any) => this.activeOrders.has(m.order_id));
-                if (makerOrder) {
-                    orderId = makerOrder.order_id;
-                    fillSize = Number(makerOrder.matched_amount || makerOrder.size);
-                } else {
-                    return; // Not tracking this order
-                }
-            } else {
-                return;
-            }
-        } else if (msg.event_type === "order") {
-            orderId = msg.id; // For 'order' events, id is the orderId
+            return;
+        }
+
+        if (msg.event_type === "order") {
+            orderId = msg.id;
 
             const tracked = this.activeOrders.get(orderId);
             if (!tracked) return;
 
-            // 'size_matched' is the cumulative total, calculate incremental fill 
             const newMatchedSize = Number(msg.size_matched);
             fillSize = newMatchedSize - tracked.matchedSize;
 
-            // Ignore updates that don't increase matched size (e.g. initial placement)
             if (fillSize <= 0) return;
+            tracked.matchedSize = newMatchedSize;
         }
 
         const tracked = this.activeOrders.get(orderId);
         if (!tracked) return;
 
-        // ALWAYS use the tracked tokenId! msg.asset_id is undefined on "order" events.
         const tokenId = tracked.tokenId;
 
         if (isNaN(fillSize) || fillSize <= 0) return;
 
-        tracked.matchedSize += fillSize;
-
         logger.info({ orderId, tokenId, fillSize, totalMatched: tracked.matchedSize, side: tracked.side }, "WS Order Fill Detected!");
-
-        console.log(`\n===========================================`);
-        console.log(`💰 ${tracked.side} ORDER FILL DETECTED (WS)!`);
-        console.log(`Token: ${tokenId} | Fill Size: ${fillSize}`);
         fillsLogger.info(
           { 
             orderId, 
@@ -181,62 +159,27 @@ export class FillListener {
         );
 
         const isFullyFilled = tracked.matchedSize >= tracked.targetSize;
-        const emoji = tracked.side === Side.BUY ? "🟢" : "🔴";
-        
-        void notify(
-          `${isFullyFilled ? "Fully" : "Partially"} Filled: ${tracked.side} ${emoji}`,
-          `Token: ${tokenId}\nFilled: ${fillSize}\nProgress: ${tracked.matchedSize.toFixed(2)} / ${tracked.targetSize}`,
-          ["zap", isFullyFilled ? "check" : "hourglass"]
-        );
 
-        // trigger sell at 0.20 if it was a buy order that completely filled
-        if (tracked.side === Side.BUY && isFullyFilled) {
-            const SELL_PRICE = 0.08;
-            const SELL_SIZE = Math.floor(tracked.targetSize);
-
-            // Note: handleFill is synchronous but we can fire and forget an async operation for the sell flow
-            (async () => {
-                try {
-                    logger.info({ orderId }, "Waiting for final order confirmation on Polygon...");
-                    await this.polygonWsClient.awaitOrderFill(orderId);
-
-                    // Give the Polymarket CLOB database 1.5 seconds to index the blockchain
-                    await new Promise(resolve => setTimeout(resolve, 1500));
-
-                    // Infinite retry loop for any placement error (e.g. balance/allowance lag)
-                    let attempt = 0;
-                    let success = false;
-
-                    while (!success) {
-                        try {
-                            attempt++;
-                            await this.placeSellFn(tokenId, SELL_PRICE, SELL_SIZE);
-                            success = true;
-                            logger.info("✅ Sell order successfully placed!");
-                        } catch (err: any) {
-                            const errMsg = err instanceof Error ? err.message : String(err);
-
-                            logger.warn({
-                                attempt,
-                                error: errMsg
-                            }, "Sell order placement failed. Retrying in 5s...");
-
-                            await new Promise(resolve => setTimeout(resolve, 5000));
-                        }
-                    }
-                } catch (error) {
-                    logger.error({
-                        orderId,
-                        error: error instanceof Error ? error.message : String(error)
-                    }, "Failed to confirm and trigger sell after WS fill detection");
-                }
-            })();
+        if (isFullyFilled) {
+          void notify(
+            `Full Fill: ${tracked.side}`,
+            `Order ${orderId.slice(0, 8)}... fully filled.`,
+            ["check"],
+          );
         }
+
+        void this.positionManager.onOrderFillProgress({
+            orderId,
+            tokenId,
+            side: tracked.side,
+            fillSize,
+            cumulativeMatchedSize: tracked.matchedSize,
+            targetSize: tracked.targetSize,
+        });
 
         if (isFullyFilled) {
             this.activeOrders.delete(orderId);
             logger.info({ orderId }, "Tracking removed (Order Closed/Filled via WS)");
-            console.log("Order fully filled, removed from WS tracking\n");
         }
     }
 

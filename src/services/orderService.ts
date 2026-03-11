@@ -8,11 +8,34 @@ import { toUtcMillis } from "../utils/time.js";
 import { ClobClientService } from "./clobClient.js";
 import type { FillListener } from "./fillListener.js";
 import type { MarketDiscoveryService } from "./marketDiscovery.js";
+import type { PositionManager } from "./positionManager.js";
+import { QuoteEngine } from "./quoteEngine.js";
 import { notify } from "../utils/notify.js";
 
 interface DesiredOrder {
   leg: MarketLeg;
   tokenId: string;
+  price: number;
+  size: number;
+  quoteReason: string;
+}
+
+const roundOrderSize = (size: number): number => Number(size.toFixed(6));
+
+export type PlacementLegStatus = "placed" | "reused" | "already_tracked" | "failed";
+
+export interface PlacementLegResult {
+  leg: MarketLeg;
+  tokenId: string;
+  status: PlacementLegStatus;
+  orderId?: string;
+  reason?: string;
+}
+
+export interface PlaceOrdersForMarketResult {
+  marketId: string;
+  conditionId: string;
+  legs: PlacementLegResult[];
 }
 
 const PRICE_TOLERANCE = 1e-9;
@@ -44,7 +67,7 @@ const hasActiveRemainingSize = (order: OpenOrder): boolean => {
   return Number.isFinite(originalSize) && Number.isFinite(matchedSize) && originalSize - matchedSize > 0;
 };
 
-const matchesTargetOrder = (order: OpenOrder, tokenId: string): boolean => {
+const matchesTargetOrder = (order: OpenOrder, tokenId: string, price: number, size: number): boolean => {
   if (order.asset_id !== tokenId || order.side !== Side.BUY || !hasActiveRemainingSize(order)) {
     return false;
   }
@@ -55,8 +78,8 @@ const matchesTargetOrder = (order: OpenOrder, tokenId: string): boolean => {
   return (
     Number.isFinite(orderPrice) &&
     Number.isFinite(orderSize) &&
-    Math.abs(orderPrice - env.ORDER_PRICE) <= PRICE_TOLERANCE &&
-    Math.abs(orderSize - env.ORDER_SIZE) <= PRICE_TOLERANCE
+    Math.abs(orderPrice - price) <= PRICE_TOLERANCE &&
+    Math.abs(orderSize - size) <= PRICE_TOLERANCE
   );
 };
 
@@ -67,10 +90,29 @@ export class OrderService {
   constructor(
     private readonly clobClientService: ClobClientService,
     private readonly fillListener: FillListener,
+    private readonly positionManager: PositionManager,
+    private readonly quoteEngine: QuoteEngine,
   ) { }
 
-  private makePlacementKey(marketId: string, tokenId: string): string {
-    return `${marketId}:${tokenId}:${env.ORDER_PRICE}:${env.ORDER_SIZE}`;
+  private makePlacementKey(marketId: string, tokenId: string, price: number, size: number): string {
+    return `${marketId}:${tokenId}:${price}:${size}`;
+  }
+
+  hydrateTrackedEntryOrder(
+    conditionId: string,
+    tokenId: string,
+    startMs: number,
+    endMs: number,
+    recurrence: string,
+    price: number,
+    size: number,
+  ): void {
+    this.placementKeys.add(this.makePlacementKey(conditionId, tokenId, price, size));
+    this.tokenToMarketDetails.set(tokenId, {
+      startMs,
+      endMs,
+      recurrence,
+    });
   }
 
   async getMaxWalletOrderStartTimeMs(marketDiscoveryService: MarketDiscoveryService): Promise<number | undefined> {
@@ -127,18 +169,110 @@ export class OrderService {
     return maxStartTimeMs;
   }
 
-  async placeOrdersForMarket(market: DiscoveredMarket): Promise<TrackedOrder[]> {
+  async placeOrdersForMarket(market: DiscoveredMarket): Promise<PlaceOrdersForMarketResult> {
     const client = this.clobClientService.getClient();
+    const entryQuotes = await Promise.all([
+      this.quoteEngine.buildEntryQuote(market, "YES", market.yesTokenId),
+      this.quoteEngine.buildEntryQuote(market, "NO", market.noTokenId),
+    ]);
     const desiredOrders: DesiredOrder[] = [
-      { leg: "YES", tokenId: market.yesTokenId },
-      { leg: "NO", tokenId: market.noTokenId },
+      {
+        leg: "YES",
+        tokenId: market.yesTokenId,
+        price: entryQuotes[0].price,
+        size: entryQuotes[0].size,
+        quoteReason: entryQuotes[0].quoteReason,
+      },
+      {
+        leg: "NO",
+        tokenId: market.noTokenId,
+        price: entryQuotes[1].price,
+        size: entryQuotes[1].size,
+        quoteReason: entryQuotes[1].quoteReason,
+      },
     ];
 
     const tokenIdsToWatch = desiredOrders.map(d => d.tokenId);
     this.fillListener.subscribeToTokens(tokenIdsToWatch);
 
-    const requiredUsdc = env.ORDER_PRICE * env.ORDER_SIZE * desiredOrders.length;
-    await this.clobClientService.assertSufficientBalance(requiredUsdc);
+    const balanceSnapshot = await this.clobClientService.getBalanceSnapshot();
+    const tradableBalance = balanceSnapshot.balanceUsdc - env.RESERVE_BALANCE_USDC;
+    if (tradableBalance <= 0) {
+      logger.warn(
+        {
+          marketId: market.marketId,
+          conditionId: market.conditionId,
+          availableUsdc: balanceSnapshot.balanceUsdc,
+          reserveBalanceUsdc: env.RESERVE_BALANCE_USDC,
+          tradableBalance,
+        },
+        "Skipped entry placement: Account balance is at or below the reserve limit.",
+      );
+      return {
+        marketId: market.marketId,
+        conditionId: market.conditionId,
+        legs: [],
+      };
+    }
+
+    let remainingUsdc = tradableBalance;
+
+    for (const [index, desired] of desiredOrders.entries()) {
+      const quoteDecision = entryQuotes[index];
+      if (!quoteDecision.shouldPlace) {
+        continue;
+      }
+
+      if (desired.price <= 0) {
+        continue;
+      }
+
+      const maxAffordableSize = remainingUsdc / desired.price;
+      const adjustedSize = roundOrderSize(Math.min(desired.size, maxAffordableSize));
+
+      if (adjustedSize < env.MIN_ORDER_SIZE) {
+        entryQuotes[index] = {
+          ...quoteDecision,
+          shouldPlace: false,
+          quoteReason: "insufficient-balance-for-min-order-size",
+        };
+        logger.info(
+          {
+            marketId: market.marketId,
+            conditionId: market.conditionId,
+            tokenId: desired.tokenId,
+            leg: desired.leg,
+            availableUsdc: balanceSnapshot.balanceUsdc,
+            tradableBalance: remainingUsdc,
+            reserveBalanceUsdc: env.RESERVE_BALANCE_USDC,
+            quotePrice: desired.price,
+            targetSize: desired.size,
+            maxAffordableSize: roundOrderSize(maxAffordableSize),
+            minOrderSize: env.MIN_ORDER_SIZE,
+          },
+          "Skipped entry placement: insufficient balance for minimum order size",
+        );
+        continue;
+      }
+
+      desired.size = adjustedSize;
+      remainingUsdc = Math.max(0, remainingUsdc - desired.price * adjustedSize);
+    }
+
+    const activeDesiredOrders = desiredOrders.filter((desired, index) => entryQuotes[index].shouldPlace);
+    if (activeDesiredOrders.length === 0) {
+      logger.info(
+        {
+          marketId: market.marketId,
+          conditionId: market.conditionId,
+          availableUsdc: balanceSnapshot.balanceUsdc,
+          tradableBalance,
+          minOrderSize: env.MIN_ORDER_SIZE,
+          reserveBalanceUsdc: env.RESERVE_BALANCE_USDC,
+        },
+        "Skipping market placement because no entry legs are affordable",
+      );
+    }
 
     const openOrders = await withRetry(
       () => client.getOpenOrders({ market: market.conditionId }),
@@ -162,9 +296,21 @@ export class OrderService {
     );
 
     const trackedOrders: TrackedOrder[] = [];
+    const legResults: PlacementLegResult[] = [];
 
     for (const desired of desiredOrders) {
-      const placementKey = this.makePlacementKey(market.conditionId, desired.tokenId);
+      const quoteDecision = desired.leg === "YES" ? entryQuotes[0] : entryQuotes[1];
+      if (!quoteDecision.shouldPlace) {
+        legResults.push({
+          leg: desired.leg,
+          tokenId: desired.tokenId,
+          status: "already_tracked",
+          reason: quoteDecision.quoteReason,
+        });
+        continue;
+      }
+
+      const placementKey = this.makePlacementKey(market.conditionId, desired.tokenId, desired.price, desired.size);
       this.tokenToMarketDetails.set(desired.tokenId, {
         startMs: toUtcMillis(market.startTime),
         endMs: toUtcMillis(market.endTime),
@@ -180,10 +326,18 @@ export class OrderService {
           },
           "Skipping duplicate placement (already tracked in-memory)",
         );
+        legResults.push({
+          leg: desired.leg,
+          tokenId: desired.tokenId,
+          status: "already_tracked",
+          reason: "placement-key-already-tracked",
+        });
         continue;
       }
 
-      const existingOrder = openOrders.find((order) => matchesTargetOrder(order, desired.tokenId));
+      const existingOrder = openOrders.find((order) =>
+        matchesTargetOrder(order, desired.tokenId, desired.price, desired.size),
+      );
       if (existingOrder) {
         this.placementKeys.add(placementKey);
         trackedOrders.push({
@@ -191,8 +345,8 @@ export class OrderService {
           marketId: market.marketId,
           conditionId: market.conditionId,
           tokenId: desired.tokenId,
-          price: env.ORDER_PRICE,
-          size: env.ORDER_SIZE,
+          price: desired.price,
+          size: desired.size,
           leg: desired.leg,
         });
 
@@ -206,6 +360,29 @@ export class OrderService {
           },
           "Found existing matching open order; reusing for tracking",
         );
+
+        legResults.push({
+          leg: desired.leg,
+          tokenId: desired.tokenId,
+          status: "reused",
+          orderId: existingOrder.id,
+        });
+
+        this.positionManager.registerEntryOrder({
+          orderId: existingOrder.id,
+          clientOrderKey: placementKey,
+          conditionId: market.conditionId,
+          marketId: market.marketId,
+          tokenId: desired.tokenId,
+          symbol: market.symbol,
+          leg: desired.leg,
+          recurrence: market.recurrence,
+          startTimeMs: toUtcMillis(market.startTime),
+          endTimeMs: toUtcMillis(market.endTime),
+          price: desired.price,
+          size: desired.size,
+          quoteReason: desired.quoteReason,
+        });
 
         continue;
       }
@@ -226,8 +403,8 @@ export class OrderService {
             client.createAndPostOrder(
               {
                 tokenID: desired.tokenId,
-                price: env.ORDER_PRICE,
-                size: env.ORDER_SIZE,
+                price: desired.price,
+                size: desired.size,
                 side: Side.BUY,
                 expiration: expirationTs,
               },
@@ -269,8 +446,8 @@ export class OrderService {
           marketId: market.marketId,
           conditionId: market.conditionId,
           tokenId: desired.tokenId,
-          price: env.ORDER_PRICE,
-          size: env.ORDER_SIZE,
+          price: desired.price,
+          size: desired.size,
           leg: desired.leg,
         });
 
@@ -281,29 +458,55 @@ export class OrderService {
             orderId,
             tokenId: desired.tokenId,
             leg: desired.leg,
-            price: env.ORDER_PRICE,
-            size: env.ORDER_SIZE,
+            price: desired.price,
+            size: desired.size,
+            quoteReason: desired.quoteReason,
           },
           "Limit order placed",
         );
 
-        void notify(
-          "BUY Limit Order Placed 🟢",
-          `Market: ${market.symbol}\nLeg: ${desired.leg}\nPrice: $${env.ORDER_PRICE}\nSize: ${env.ORDER_SIZE} shares\nTime: ${market.startTime}`,
-          ["green_circle"]
-        );
+        legResults.push({
+          leg: desired.leg,
+          tokenId: desired.tokenId,
+          status: "placed",
+          orderId,
+        });
+
+        this.positionManager.registerEntryOrder({
+          orderId,
+          clientOrderKey: placementKey,
+          conditionId: market.conditionId,
+          marketId: market.marketId,
+          tokenId: desired.tokenId,
+          symbol: market.symbol,
+          leg: desired.leg,
+          recurrence: market.recurrence,
+          startTimeMs: toUtcMillis(market.startTime),
+          endTimeMs: toUtcMillis(market.endTime),
+          price: desired.price,
+          size: desired.size,
+          quoteReason: desired.quoteReason,
+        });
       } catch (error) {
         this.placementKeys.delete(placementKey);
+        const errorMessage = error instanceof Error ? error.message : String(error);
         logger.error(
           {
             marketId: market.marketId,
             conditionId: market.conditionId,
             tokenId: desired.tokenId,
             leg: desired.leg,
-            error: error instanceof Error ? error.message : String(error),
+            error: errorMessage,
           },
           "Failed to place limit order for leg",
         );
+
+        legResults.push({
+          leg: desired.leg,
+          tokenId: desired.tokenId,
+          status: "failed",
+          reason: errorMessage,
+        });
       }
     }
 
@@ -312,17 +515,25 @@ export class OrderService {
         { marketId: market.marketId, conditionId: market.conditionId },
         "All legs already placed or skipped for market",
       );
-      return trackedOrders;
+      return {
+        marketId: market.marketId,
+        conditionId: market.conditionId,
+        legs: legResults,
+      };
     }
 
     for (const order of trackedOrders) {
       this.fillListener.trackOrder(order.orderId, order.tokenId, order.size, Side.BUY);
     }
 
-    return trackedOrders;
+    return {
+      marketId: market.marketId,
+      conditionId: market.conditionId,
+      legs: legResults,
+    };
   }
 
-  async placeSellOrder(tokenId: string, price: number, size: number): Promise<void> {
+  async placeSellOrder(tokenId: string, price: number, size: number, positionId?: string): Promise<string> {
     const client = this.clobClientService.getClient();
 
     const marketDetails = this.tokenToMarketDetails.get(tokenId);
@@ -342,7 +553,7 @@ export class OrderService {
 
     const creationConfig = await this.clobClientService.getOrderCreationConfig(tokenId);
 
-    logger.info({ tokenId, price, size, expirationTs }, "Placing SELL limit order via fill listener");
+    logger.info({ tokenId, price, size, expirationTs, positionId }, "Placing SELL limit order");
 
     const response = await withRetry(
       () =>
@@ -393,16 +604,6 @@ export class OrderService {
       "Sell limit order placed successfully",
     );
 
-    void notify(
-      "SELL Limit Order Placed 🔴",
-      `Token: ${tokenId}\nPrice: $${price}\nSize: ${size} shares\nOrder ID: ${orderId.slice(0, 8)}...`,
-      ["red_circle"]
-    );
-
-    console.log(`\n===========================================`);
-    console.log(`🚀 SELL LIMIT ORDER PLACED!`);
-    console.log(`Order ID: ${orderId}`);
-    console.log(`Token: ${tokenId} | Size: ${size} | Price: $${price}`);
-    console.log(`===========================================\n`);
+    return orderId;
   }
 }

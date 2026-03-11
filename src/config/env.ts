@@ -24,8 +24,9 @@ const envSchema = z.object({
   CLOB_API_URL: z.string().url().default("https://clob.polymarket.com"),
   CHAIN_ID: z.coerce.number().int().default(137),
   ALCHEMY_WS_URL: z.string().url().default("wss://polygon-mainnet.g.alchemy.com/v2/4X-3b-IvrTq_9JAeVQW-M"),
+  STATE_DB_PATH: z.string().trim().min(1).default("data/state.sqlite"),
 
-  MARKET_POLL_INTERVAL_SECONDS: z.coerce.number().int().positive().default(30),
+  MARKET_POLL_INTERVAL_SECONDS: z.coerce.number().int().positive().default(15),
   DISCOVERY_MARKET_LIMIT: z.coerce.number().int().positive().default(500),
   TARGET_MARKET_COUNT: z.coerce.number().int().positive().default(4),
   STARTUP_MARKET_LOOKAHEAD_CYCLES: z.coerce.number().int().positive().default(4),
@@ -33,14 +34,24 @@ const envSchema = z.object({
 
   ORDER_PRICE: z.coerce.number().positive().max(1).default(0.04),
   ORDER_SIZE: z.coerce.number().positive().default(5),
+  MIN_ORDER_SIZE: z.coerce.number().positive().default(5),
+  MIN_RESERVE_USDC: z.coerce.number().nonnegative().default(2),
+  RESERVE_BALANCE_USDC: z.coerce.number().nonnegative().default(5),
   ORDER_PLACE_MINUTES_BEFORE_START: z.coerce.number().int().nonnegative().default(15),
-  ORDER_EXPIRATION_SECONDS: z.coerce.number().int().positive().default(180),
+  ORDER_EXPIRATION_SECONDS: z.coerce.number().int().positive().default(45),
+  DYNAMIC_QUOTING_ENABLED: z.coerce.boolean().default(true),
+  ENTRY_EDGE_BUFFER: z.coerce.number().nonnegative().default(0.025),
+  EXIT_EDGE_BUFFER: z.coerce.number().nonnegative().default(0.01),
+  ADVERSE_SELECTION_BUFFER: z.coerce.number().nonnegative().default(0.015),
+  DEFAULT_FEE_RATE_BPS: z.coerce.number().nonnegative().default(0),
+  SELL_PLACEMENT_MAX_RETRIES: z.coerce.number().int().positive().default(5),
+  SELL_PLACEMENT_RETRY_DELAY_MS: z.coerce.number().int().positive().default(5_000),
 
   MAX_RETRIES: z.coerce.number().int().positive().default(3),
   RETRY_BASE_DELAY_MS: z.coerce.number().int().positive().default(500),
 
   LOG_LEVEL: z.enum(logLevels).default("info"),
-  NTFY_TOPIC: z.string().optional().default("PolyBot"),
+  NTFY_TOPIC: z.string().optional().default(""),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -2,6 +2,7 @@ import {
   AssetType,
   Chain,
   ClobClient,
+  type OrderBookSummary,
   SignatureType,
   getContractConfig,
   type ApiKeyCreds,
@@ -92,6 +93,14 @@ const collectAllowanceCandidates = (input: unknown): number[] => {
 export interface BalanceSnapshot {
   balanceUsdc: number;
   allowanceUsdc: number;
+}
+
+export interface OrderBookSnapshot {
+  tokenId: string;
+  bestBid?: number;
+  bestAsk?: number;
+  tickSize: number;
+  lastTradePrice?: number;
 }
 
 export class ClobClientService {
@@ -345,5 +354,59 @@ export class ClobClientService {
     this.negRiskCache.set(tokenId, negRisk);
 
     return { tickSize, negRisk };
+  }
+
+  async getOrderBookSnapshot(tokenId: string): Promise<OrderBookSnapshot> {
+    const book = await withRetry(
+      () => this.client.getOrderBook(tokenId),
+      {
+        attempts: env.MAX_RETRIES,
+        baseDelayMs: env.RETRY_BASE_DELAY_MS,
+        label: "order-book",
+        onRetry: (attempt, error, delayMs) => {
+          logger.warn(
+            {
+              tokenId,
+              attempt,
+              delayMs,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            "Order book fetch failed; retrying",
+          );
+        },
+      },
+    );
+
+    return this.parseOrderBookSnapshot(tokenId, book);
+  }
+
+  async getFeeRateBps(tokenId: string): Promise<number> {
+    try {
+      return await withRetry(
+        () => this.client.getFeeRateBps(tokenId),
+        {
+          attempts: env.MAX_RETRIES,
+          baseDelayMs: env.RETRY_BASE_DELAY_MS,
+          label: "fee-rate",
+        },
+      );
+    } catch {
+      return env.DEFAULT_FEE_RATE_BPS;
+    }
+  }
+
+  private parseOrderBookSnapshot(tokenId: string, book: OrderBookSummary): OrderBookSnapshot {
+    const bestBid = book.bids.length > 0 ? Number(book.bids[0]?.price) : undefined;
+    const bestAsk = book.asks.length > 0 ? Number(book.asks[0]?.price) : undefined;
+    const tickSize = Number(book.tick_size || "0.01");
+    const lastTradePrice = book.last_trade_price ? Number(book.last_trade_price) : undefined;
+
+    return {
+      tokenId,
+      bestBid: Number.isFinite(bestBid) ? bestBid : undefined,
+      bestAsk: Number.isFinite(bestAsk) ? bestAsk : undefined,
+      tickSize: Number.isFinite(tickSize) && tickSize > 0 ? tickSize : 0.01,
+      lastTradePrice: Number.isFinite(lastTradePrice) ? lastTradePrice : undefined,
+    };
   }
 }

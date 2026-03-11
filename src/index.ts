@@ -5,6 +5,9 @@ import { MarketDiscoveryService } from "./services/marketDiscovery.js";
 import { OrderService } from "./services/orderService.js";
 import { FillListener } from "./services/fillListener.js";
 import { PolygonWsClient } from "./services/polygonWsClient.js";
+import { PositionManager } from "./services/positionManager.js";
+import { PositionStore } from "./services/positionStore.js";
+import { QuoteEngine } from "./services/quoteEngine.js";
 import { logger } from "./utils/logger.js";
 
 const bootstrap = async (): Promise<void> => {
@@ -43,25 +46,25 @@ const bootstrap = async (): Promise<void> => {
   );
 
   const marketDiscoveryService = new MarketDiscoveryService();
+  const positionStore = new PositionStore();
 
   const polygonWsClient = new PolygonWsClient();
   await polygonWsClient.connect();
+  const quoteEngine = new QuoteEngine(clobClientService);
 
-  // Create FillListener first so we can pass it to OrderService
-  // but we declare a late-binding arrow function to call orderService
-  const fillListener = new FillListener(
-    async (tokenId, price, size) => {
-      await orderService.placeSellOrder(tokenId, price, size);
-    },
-    polygonWsClient
-  );
-  fillListener.setClobClient(clobClientService);
+  const positionManager = new PositionManager(positionStore, clobClientService, polygonWsClient, quoteEngine);
+  positionManager.init();
+
+  const fillListener = new FillListener(positionManager);
 
   await fillListener.connect();
 
-  const orderService = new OrderService(clobClientService, fillListener);
+  const orderService = new OrderService(clobClientService, fillListener, positionManager, quoteEngine);
+  positionManager.setOrderService(orderService);
 
-  const scheduler = new OrderScheduler(marketDiscoveryService, orderService);
+  await positionManager.rehydrate(fillListener);
+
+  const scheduler = new OrderScheduler(marketDiscoveryService, orderService, positionManager);
   await scheduler.start();
 
   const shutdown = (signal: NodeJS.Signals): void => {
