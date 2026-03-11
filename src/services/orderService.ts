@@ -1,5 +1,5 @@
 import { OrderType, Side, type OpenOrder } from "@polymarket/clob-client";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { env } from "../config/env.js";
 import type { DiscoveredMarket } from "../types/market.js";
 import type { MarketLeg, TrackedOrder } from "../types/order.js";
@@ -9,6 +9,7 @@ import { toUtcMillis } from "../utils/time.js";
 import { ClobClientService } from "./clobClient.js";
 import type { FillListener } from "./fillListener.js";
 import type { MarketDiscoveryService } from "./marketDiscovery.js";
+import { MarketBookService } from "./marketBookService.js";
 import type { PositionManager } from "./positionManager.js";
 import type { PositionStore } from "./positionStore.js";
 import { QuoteEngine } from "./quoteEngine.js";
@@ -101,6 +102,7 @@ export class OrderService {
   constructor(
     private readonly clobClientService: ClobClientService,
     private readonly fillListener: FillListener,
+    private readonly marketBookService: MarketBookService,
     private readonly positionManager: PositionManager,
     private readonly quoteEngine: QuoteEngine,
     private readonly positionStore: PositionStore,
@@ -112,6 +114,11 @@ export class OrderService {
 
   private makePaperOrderId(role: "entry" | "exit", tokenId: string): string {
     return `paper:${role}:${tokenId}:${Date.now()}:${randomUUID()}`;
+  }
+
+  private makeDeterministicNonce(seed: string): number {
+    const digest = createHash("sha256").update(seed).digest();
+    return Math.max(1, digest.readUInt32BE(0) % 2_000_000_000);
   }
 
   hydrateTrackedEntryOrder(
@@ -198,6 +205,7 @@ export class OrderService {
     paperContext?: PaperTradeSchedulerContext,
   ): Promise<PlaceOrdersForMarketResult> {
     const client = this.clobClientService.getClient();
+    await this.marketBookService.subscribeTokens([market.yesTokenId, market.noTokenId]);
     const entryQuotes = await Promise.all([
       this.quoteEngine.buildEntryQuote(market, "YES", market.yesTokenId),
       this.quoteEngine.buildEntryQuote(market, "NO", market.noTokenId),
@@ -506,6 +514,7 @@ export class OrderService {
         }
 
         const creationConfig = await this.clobClientService.getOrderCreationConfig(desired.tokenId);
+        const orderNonce = this.makeDeterministicNonce(`entry:${placementKey}`);
         let expirationTs: number;
         if (market.recurrence === "15m") {
           expirationTs = Math.floor(toUtcMillis(market.endTime) / 1000) - 4 * 60;
@@ -521,6 +530,8 @@ export class OrderService {
                 price: desired.price,
                 size: desired.size,
                 side: Side.BUY,
+                nonce: orderNonce,
+                feeRateBps: quoteDecision.feeRateBps,
                 expiration: expirationTs,
               },
               {
@@ -650,7 +661,13 @@ export class OrderService {
     };
   }
 
-  async placeSellOrder(tokenId: string, price: number, size: number, positionId?: string): Promise<string> {
+  async placeSellOrder(
+    tokenId: string,
+    price: number,
+    size: number,
+    positionId?: string,
+    feeRateBps?: number,
+  ): Promise<string> {
     const marketDetails = this.tokenToMarketDetails.get(tokenId);
     let expirationTs: number;
 
@@ -667,6 +684,7 @@ export class OrderService {
     }
 
     logger.info({ tokenId, price, size, expirationTs, positionId }, "Placing SELL limit order");
+    await this.marketBookService.subscribeTokens([tokenId]);
 
     if (env.DRY_RUN) {
       this.fillListener.subscribeToTokens([tokenId]);
@@ -677,6 +695,7 @@ export class OrderService {
 
     const client = this.clobClientService.getClient();
     const creationConfig = await this.clobClientService.getOrderCreationConfig(tokenId);
+    const orderNonce = this.makeDeterministicNonce(`exit:${positionId ?? tokenId}:${price}:${size}`);
 
     const response = await withRetry(
       () =>
@@ -686,6 +705,8 @@ export class OrderService {
             price: price,
             size: size,
             side: Side.SELL, // Sell side to unload the filled purchase
+            nonce: orderNonce,
+            feeRateBps,
             expiration: expirationTs,
           },
           {

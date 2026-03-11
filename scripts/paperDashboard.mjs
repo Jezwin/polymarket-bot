@@ -117,11 +117,72 @@ const getActionRows = () => {
   });
 };
 
+const getPendingRows = () => {
+  if (!db) {
+    return [];
+  }
+
+  const selectPendingRows = hasPaperTradesTable
+    ? `
+      SELECT
+        o.id AS orderId,
+        o.position_id AS positionId,
+        COALESCE(pt.market_name, p.symbol || ' ' || p.recurrence || ' market') AS marketName,
+        p.symbol AS symbol,
+        p.leg AS leg,
+        CASE WHEN o.order_role = 'exit' THEN 'SELL' ELSE 'BUY' END AS action,
+        o.price AS targetPrice,
+        o.size AS size,
+        CASE
+          WHEN o.order_role = 'exit' THEN COALESCE(p.exit_reason, 'pending-exit')
+          ELSE COALESCE(p.quote_reason, 'pending-entry')
+        END AS reason,
+        p.start_time_ms AS marketOpenMs,
+        p.end_time_ms AS marketCloseMs
+      FROM orders o
+      INNER JOIN positions p ON p.id = o.position_id
+      LEFT JOIN paper_trades pt ON pt.position_id = o.position_id
+      WHERE o.id LIKE 'paper:%'
+        AND o.status IN ('open', 'pending_submit', 'partially_filled')
+      ORDER BY p.start_time_ms ASC, o.created_at_ms ASC, o.id ASC
+    `
+    : `
+      SELECT
+        o.id AS orderId,
+        o.position_id AS positionId,
+        p.symbol || ' ' || p.recurrence || ' market' AS marketName,
+        p.symbol AS symbol,
+        p.leg AS leg,
+        CASE WHEN o.order_role = 'exit' THEN 'SELL' ELSE 'BUY' END AS action,
+        o.price AS targetPrice,
+        o.size AS size,
+        CASE
+          WHEN o.order_role = 'exit' THEN COALESCE(p.exit_reason, 'pending-exit')
+          ELSE COALESCE(p.quote_reason, 'pending-entry')
+        END AS reason,
+        p.start_time_ms AS marketOpenMs,
+        p.end_time_ms AS marketCloseMs
+      FROM orders o
+      INNER JOIN positions p ON p.id = o.position_id
+      WHERE o.id LIKE 'paper:%'
+        AND o.status IN ('open', 'pending_submit', 'partially_filled')
+      ORDER BY p.start_time_ms ASC, o.created_at_ms ASC, o.id ASC
+    `;
+
+  return db.prepare(selectPendingRows).all();
+};
+
 app.get("/api/summary", json(() => ({
   dbPath,
   hasPaperTradesTable,
   startingMockBalance,
   actions: getActionRows(),
+})));
+
+app.get("/api/pending", json(() => ({
+  dbPath,
+  hasPaperTradesTable,
+  pending: getPendingRows(),
 })));
 
 app.get("/", (_req, res) => {
@@ -243,6 +304,15 @@ app.get("/", (_req, res) => {
         background: rgba(15, 118, 110, 0.08);
         border: 1px solid rgba(15, 118, 110, 0.18);
       }
+
+      .section-stack {
+        display: grid;
+        gap: 20px;
+      }
+
+      .empty-row td {
+        color: var(--muted);
+      }
     </style>
   </head>
   <body>
@@ -253,34 +323,64 @@ app.get("/", (_req, res) => {
         <p id="meta">Loading paper trading actions...</p>
       </section>
 
-      <section class="card">
-        <h2>Grouped Actions</h2>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Action</th>
-                <th>Market</th>
-                <th>Symbol</th>
-                <th>Leg</th>
-                <th>Price</th>
-                <th>Size</th>
-                <th>Fulfilled</th>
-                <th>Reason</th>
-                <th>Realized PnL</th>
-                <th>Mock Balance</th>
-              </tr>
-            </thead>
-            <tbody id="actionsBody"></tbody>
-          </table>
-        </div>
-      </section>
+      <div class="section-stack">
+        <section class="card">
+          <h2>Pending / Unfulfilled Actions</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Market</th>
+                  <th>Symbol</th>
+                  <th>Leg</th>
+                  <th>Action</th>
+                  <th>Target Price</th>
+                  <th>Size</th>
+                  <th>Reason</th>
+                  <th>Market Open (Est)</th>
+                  <th>Market Close (Est)</th>
+                </tr>
+              </thead>
+              <tbody id="pendingBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Completed Actions</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Action</th>
+                  <th>Market</th>
+                  <th>Symbol</th>
+                  <th>Leg</th>
+                  <th>Price</th>
+                  <th>Size</th>
+                  <th>Fulfilled</th>
+                  <th>Reason</th>
+                  <th>Realized PnL</th>
+                  <th>Mock Balance</th>
+                </tr>
+              </thead>
+              <tbody id="actionsBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
     </main>
 
     <script>
+      const POLL_INTERVAL_MS = 2000;
       const fmt = (value) => Number(value ?? 0).toFixed(4);
-      const fmtTime = (value) => value ? new Date(value).toLocaleString() : "-";
+      const fmtTime = (value) => value
+        ? new Date(value).toLocaleString("en-US", {
+          timeZone: "America/New_York",
+          hour12: true,
+        })
+        : "-";
       const escapeHtml = (value) => String(value ?? "-")
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -307,14 +407,14 @@ app.get("/", (_req, res) => {
         return groups;
       };
 
-      const renderActions = (payload) => {
-        const meta = document.getElementById("meta");
-        meta.textContent = payload.hasPaperTradesTable
-          ? "Running mock balance starts at $" + fmt(payload.startingMockBalance) + ", is computed chronologically across all actions, and is then displayed in market groups. Source: " + payload.dbPath
-          : "paper_trades table not found yet. Run the bot with DRY_RUN=true to populate it.";
-
+      const renderActions = (actions) => {
         const tbody = document.getElementById("actionsBody");
-        const groups = groupActionsByMarket(payload.actions);
+        const groups = groupActionsByMarket(actions);
+
+        if (groups.length === 0) {
+          tbody.innerHTML = "<tr class='empty-row'><td colspan='11'>No completed paper actions yet.</td></tr>";
+          return;
+        }
 
         tbody.innerHTML = groups.map((group) => {
           const header = "<tr class='market-row'><td colspan='11'><span class='market-chip'>" +
@@ -343,12 +443,78 @@ app.get("/", (_req, res) => {
         }).join("");
       };
 
-      fetch("/api/summary")
-        .then((response) => response.json())
-        .then(renderActions)
-        .catch((error) => {
+      const renderPending = (pendingRows) => {
+        const tbody = document.getElementById("pendingBody");
+
+        if (pendingRows.length === 0) {
+          tbody.innerHTML = "<tr class='empty-row'><td colspan='9'>No pending paper orders.</td></tr>";
+          return;
+        }
+
+        tbody.innerHTML = pendingRows.map((row) =>
+          "<tr>" +
+            "<td>" + escapeHtml(row.marketName || row.symbol || "-") + "</td>" +
+            "<td>" + escapeHtml(row.symbol) + "</td>" +
+            "<td>" + escapeHtml(row.leg) + "</td>" +
+            "<td>" + escapeHtml(row.action) + "</td>" +
+            "<td>" + fmt(row.targetPrice) + "</td>" +
+            "<td>" + fmt(row.size) + "</td>" +
+            "<td>" + escapeHtml(row.reason ?? "-") + "</td>" +
+            "<td>" + fmtTime(row.marketOpenMs) + "</td>" +
+            "<td>" + fmtTime(row.marketCloseMs) + "</td>" +
+          "</tr>"
+        ).join("");
+      };
+
+      const requestJson = async (url) => {
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(url + " returned " + response.status);
+        }
+
+        return response.json();
+      };
+
+      let refreshInFlight = false;
+
+      const refreshDashboard = async () => {
+        if (refreshInFlight) {
+          return;
+        }
+
+        refreshInFlight = true;
+
+        try {
+          const [summary, pending] = await Promise.all([
+            requestJson("/api/summary"),
+            requestJson("/api/pending"),
+          ]);
+
+          const meta = document.getElementById("meta");
+          meta.textContent = summary.hasPaperTradesTable
+            ? "Running mock balance starts at $" + fmt(summary.startingMockBalance) +
+              ", is computed chronologically across all actions, and refreshes every " +
+              (POLL_INTERVAL_MS / 1000) +
+              "s without a page reload. Completed actions: " +
+              summary.actions.length +
+              ". Pending orders: " +
+              pending.pending.length +
+              ". Source: " + summary.dbPath
+            : "paper_trades table not found yet. Run the bot with DRY_RUN=true to populate it.";
+
+          renderActions(summary.actions);
+          renderPending(pending.pending);
+        } catch (error) {
           document.getElementById("meta").textContent = "Dashboard load failed: " + error.message;
-        });
+        } finally {
+          refreshInFlight = false;
+        }
+      };
+
+      void refreshDashboard();
+      setInterval(() => {
+        void refreshDashboard();
+      }, POLL_INTERVAL_MS);
     </script>
   </body>
 </html>`);

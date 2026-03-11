@@ -22,12 +22,14 @@ const envSchema = z.object({
   POLY_SIGNATURE_TYPE: z.coerce.number().int().min(0).max(2).default(0),
 
   CLOB_API_URL: z.string().url().default("https://clob.polymarket.com"),
+  MARKET_WS_URL: z.string().url().default("wss://ws-subscriptions-clob.polymarket.com/ws/market"),
   CHAIN_ID: z.coerce.number().int().default(137),
   ALCHEMY_WS_URL: z.string().url().default("wss://polygon-mainnet.g.alchemy.com/v2/4X-3b-IvrTq_9JAeVQW-M"),
   STATE_DB_PATH: z.string().trim().min(1).default("data/state.sqlite"),
   DRY_RUN: z.coerce.boolean().default(false),
 
   MARKET_POLL_INTERVAL_SECONDS: z.coerce.number().int().positive().default(15),
+  MARKET_BOOK_REPAIR_INTERVAL_SECONDS: z.coerce.number().int().positive().default(60),
   DISCOVERY_MARKET_LIMIT: z.coerce.number().int().positive().default(500),
   TARGET_MARKET_COUNT: z.coerce.number().int().positive().default(4),
   STARTUP_MARKET_LOOKAHEAD_CYCLES: z.coerce.number().int().positive().default(4),

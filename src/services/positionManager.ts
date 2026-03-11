@@ -4,11 +4,13 @@ import { logger } from "../utils/logger.js";
 import { notify } from "../utils/notify.js";
 import { ClobClientService } from "./clobClient.js";
 import type { FillListener } from "./fillListener.js";
+import { MarketBookService } from "./marketBookService.js";
 import type { OrderService } from "./orderService.js";
 import { PolygonWsClient } from "./polygonWsClient.js";
 import { QuoteEngine } from "./quoteEngine.js";
 import {
   PositionStore,
+  type PersistedOpenEntryOrder,
   type PersistedOpenExitOrder,
 } from "./positionStore.js";
 
@@ -83,6 +85,7 @@ export class PositionManager {
   constructor(
     private readonly store: PositionStore,
     private readonly clobClientService: ClobClientService,
+    private readonly marketBookService: MarketBookService,
     private readonly polygonWsClient: PolygonWsClient,
     private readonly quoteEngine: QuoteEngine,
   ) {}
@@ -175,11 +178,13 @@ export class PositionManager {
     const client = this.clobClientService.getClient();
     const openOrders = await client.getOpenOrders();
     const remoteOpenOrderIds = new Set(openOrders.map((order) => order.id));
+    const tokensToTrack = new Set<string>();
     let restoredTrackedOrders = 0;
     let missingRemoteOrders = 0;
     let resumedExitCandidates = 0;
 
     for (const order of this.store.getTrackedOpenOrders()) {
+      tokensToTrack.add(order.tokenId);
       if (order.orderRole === "entry") {
         this.orderService?.hydrateTrackedEntryOrder(
           order.conditionId,
@@ -203,6 +208,7 @@ export class PositionManager {
     }
 
     for (const position of this.store.getExitCandidates()) {
+      tokensToTrack.add(position.tokenId);
       if (this.store.hasOpenExitOrder(position.positionId)) {
         continue;
       }
@@ -219,6 +225,8 @@ export class PositionManager {
       },
       "Position manager rehydrate summary",
     );
+
+    await this.marketBookService.subscribeTokens([...tokensToTrack]);
   }
 
   async simulateOrderFill(input: SyntheticFillProgressInput): Promise<void> {
@@ -295,7 +303,11 @@ export class PositionManager {
 
     for (const [tokenId, pendingEntries] of pendingEntriesByToken.entries()) {
       try {
-        const book = await this.clobClientService.getOrderBookSnapshot(tokenId);
+        const book = this.marketBookService.getSnapshot(tokenId);
+        if (!book) {
+          continue;
+        }
+
         if (book.bestAsk === undefined) {
           continue;
         }
@@ -320,6 +332,35 @@ export class PositionManager {
           "Failed to validate pending paper entry against live order book",
         );
       }
+    }
+  }
+
+  async manageExpiredEntries(now = Date.now()): Promise<void> {
+    const openEntries = this.store.getActiveZeroFillEntryOrders();
+
+    for (const openEntry of openEntries) {
+      if (!this.isEntryExpired(openEntry, now)) {
+        continue;
+      }
+
+      const cancelled = await this.cancelOrder(openEntry.orderId, "cancelled");
+      if (!cancelled) {
+        continue;
+      }
+
+      this.store.markEntryExpired(openEntry.positionId, "expired-unfilled-entry");
+      logger.info(
+        {
+          orderId: openEntry.orderId,
+          positionId: openEntry.positionId,
+          tokenId: openEntry.tokenId,
+          recurrence: openEntry.recurrence,
+          startTimeMs: openEntry.startTimeMs,
+          endTimeMs: openEntry.endTimeMs,
+          now,
+        },
+        "Expired zero-fill entry order and marked position terminal",
+      );
     }
   }
 
@@ -380,6 +421,7 @@ export class PositionManager {
           : openExit.startTimeMs + 4 * 60_000;
       const nearDeadline = now >= expiryDeadlineMs - env.MARKET_POLL_INTERVAL_SECONDS * 1_000;
 
+      await this.marketBookService.subscribeTokens([openExit.tokenId]);
       const quote = await this.quoteEngine.buildExitQuote({
         tokenId: openExit.tokenId,
         size: openExit.filledSize,
@@ -408,6 +450,7 @@ export class PositionManager {
         replacementPrice,
         quote.size,
         openExit.positionId,
+        quote.feeRateBps,
       );
 
       if (!replacementOrderId) {
@@ -448,6 +491,21 @@ export class PositionManager {
           nearDeadline,
         },
         "Refreshed stale exit order",
+      );
+    }
+  }
+
+  private async reconcileEntryFillAsync(entryOrderId: string, positionId: string): Promise<void> {
+    try {
+      await this.polygonWsClient.awaitOrderFill(entryOrderId);
+    } catch (error) {
+      logger.warn(
+        {
+          positionId,
+          entryOrderId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Asynchronous Polygon fill reconciliation failed",
       );
     }
   }
@@ -494,27 +552,23 @@ export class PositionManager {
     }
 
     if (entryOrderId && !env.DRY_RUN) {
-      try {
-        await this.polygonWsClient.awaitOrderFill(entryOrderId);
-      } catch (error) {
-        logger.warn(
-          {
-            positionId,
-            entryOrderId,
-            error: error instanceof Error ? error.message : String(error),
-          },
-          "Polygon confirmation failed before exit placement; continuing with persisted exit workflow",
-        );
-      }
+      void this.reconcileEntryFillAsync(entryOrderId, positionId);
     }
 
     try {
+      await this.marketBookService.subscribeTokens([tokenId]);
       const quote = await this.quoteEngine.buildExitQuote({
         tokenId,
         size,
         entryPrice: position.entryPriceActual ?? position.entryTargetPrice,
       });
-      const orderId = await this.orderService.placeSellOrder(tokenId, quote.price, quote.size, positionId);
+      const orderId = await this.orderService.placeSellOrder(
+        tokenId,
+        quote.price,
+        quote.size,
+        positionId,
+        quote.feeRateBps,
+      );
 
       this.registerExitOrder({
         orderId,
@@ -566,6 +620,15 @@ export class PositionManager {
 
   private getPositionId(conditionId: string, tokenId: string): string {
     return `${conditionId}:${tokenId}`;
+  }
+
+  private isEntryExpired(entry: PersistedOpenEntryOrder, now: number): boolean {
+    const timeBasedExpiryMs =
+      entry.recurrence === "15m"
+        ? entry.endTimeMs - 4 * 60_000
+        : entry.startTimeMs + env.ORDER_EXPIRATION_SECONDS * 1_000;
+
+    return now >= timeBasedExpiryMs || now >= entry.endTimeMs;
   }
 
   private async cancelOrder(orderId: string, nextStatus: "cancelled" | "failed"): Promise<boolean> {

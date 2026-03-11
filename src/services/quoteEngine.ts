@@ -1,6 +1,12 @@
 import { env } from "../config/env.js";
 import type { DiscoveredMarket } from "../types/market.js";
-import { ClobClientService, type OrderBookSnapshot } from "./clobClient.js";
+import {
+  calculateEffectiveBuyUnitCost,
+  findMaxEntryPriceForTargetCost,
+  findRequiredExitPriceForTargetProceeds,
+} from "./feeModel.js";
+import type { OrderBookSnapshot } from "./clobClient.js";
+import { MarketBookService } from "./marketBookService.js";
 import { logger } from "../utils/logger.js";
 
 const clampPrice = (price: number, tickSize: number): number => {
@@ -42,7 +48,7 @@ interface ExitContext {
 }
 
 export class QuoteEngine {
-  constructor(private readonly clobClientService: ClobClientService) {}
+  constructor(private readonly marketBookService: MarketBookService) {}
 
   async buildEntryQuote(
     market: DiscoveredMarket,
@@ -62,11 +68,31 @@ export class QuoteEngine {
 
     const primaryTokenId = leg === "YES" ? market.yesTokenId : market.noTokenId;
     const oppositeTokenId = leg === "YES" ? market.noTokenId : market.yesTokenId;
-    const [primaryBook, oppositeBook, feeRateBps] = await Promise.all([
-      this.clobClientService.getOrderBookSnapshot(primaryTokenId),
-      this.clobClientService.getOrderBookSnapshot(oppositeTokenId),
-      this.clobClientService.getFeeRateBps(primaryTokenId),
-    ]);
+    const primaryBook = this.marketBookService.getSnapshot(primaryTokenId);
+    const oppositeBook = this.marketBookService.getSnapshot(oppositeTokenId);
+    const feeRateBps = this.marketBookService.getFeeRateBps(primaryTokenId);
+
+    if (!primaryBook || !oppositeBook) {
+      logger.debug?.(
+        {
+          symbol: market.symbol,
+          leg,
+          tokenId,
+          primaryBookAvailable: Boolean(primaryBook),
+          oppositeBookAvailable: Boolean(oppositeBook),
+        },
+        "Entry quote skipped because local orderbook is not ready",
+      );
+
+      return {
+        shouldPlace: false,
+        price: env.ORDER_PRICE,
+        size: env.ORDER_SIZE,
+        quoteReason: "local-orderbook-not-ready",
+        fairValue: env.ORDER_PRICE,
+        feeRateBps,
+      };
+    }
 
     const primaryMid = midpoint(primaryBook);
     const oppositeMid = midpoint(oppositeBook);
@@ -75,24 +101,30 @@ export class QuoteEngine {
       primaryBook.tickSize,
     );
 
-    const feeComponent = feeRateBps / 10_000;
+    const targetUnitCost = Math.max(primaryBook.tickSize, fairValue - env.ENTRY_EDGE_BUFFER - env.ADVERSE_SELECTION_BUFFER);
     const targetPrice = clampPrice(
-      fairValue - env.ENTRY_EDGE_BUFFER - env.ADVERSE_SELECTION_BUFFER - feeComponent,
+      findMaxEntryPriceForTargetCost(targetUnitCost, feeRateBps, primaryBook.tickSize),
       primaryBook.tickSize,
     );
+    const effectiveEntryUnitCost = calculateEffectiveBuyUnitCost(targetPrice, feeRateBps);
 
     if (primaryBook.bestBid !== undefined && targetPrice + primaryBook.tickSize < primaryBook.bestBid) {
-      logger.info({
-        symbol: market.symbol,
-        leg,
-        tokenId,
-        fairValue,
-        targetPrice,
-        bestBid: primaryBook.bestBid,
-        bestAsk: primaryBook.bestAsk,
-        feeRateBps,
-        quoteReason: "best-bid-too-rich",
-      }, "Entry quote skipped");
+      logger.info(
+        {
+          symbol: market.symbol,
+          leg,
+          tokenId,
+          fairValue,
+          targetPrice,
+          targetUnitCost,
+          effectiveEntryUnitCost,
+          bestBid: primaryBook.bestBid,
+          bestAsk: primaryBook.bestAsk,
+          feeRateBps,
+          quoteReason: "best-bid-too-rich",
+        },
+        "Entry quote skipped",
+      );
       return {
         shouldPlace: false,
         price: targetPrice,
@@ -118,17 +150,23 @@ export class QuoteEngine {
       primaryBook.tickSize,
     );
 
-    logger.info({
-      symbol: market.symbol,
-      leg,
-      tokenId,
-      fairValue,
-      bestBid: primaryBook.bestBid,
-      bestAsk: primaryBook.bestAsk,
-      feeRateBps,
-      quotePrice,
-      quoteReason: "dynamic-entry",
-    }, "Entry quote decision");
+    logger.info(
+      {
+        symbol: market.symbol,
+        leg,
+        tokenId,
+        fairValue,
+        targetPrice,
+        targetUnitCost,
+        effectiveEntryUnitCost,
+        bestBid: primaryBook.bestBid,
+        bestAsk: primaryBook.bestAsk,
+        feeRateBps,
+        quotePrice,
+        quoteReason: "dynamic-entry",
+      },
+      "Entry quote decision",
+    );
 
     return {
       shouldPlace: true,
@@ -154,39 +192,67 @@ export class QuoteEngine {
       };
     }
 
-    const [book, feeRateBps] = await Promise.all([
-      this.clobClientService.getOrderBookSnapshot(input.tokenId),
-      this.clobClientService.getFeeRateBps(input.tokenId),
-    ]);
+    const book = this.marketBookService.getSnapshot(input.tokenId);
+    const feeRateBps = this.marketBookService.getFeeRateBps(input.tokenId);
 
-    const feeComponent = feeRateBps / 10_000;
+    if (!book) {
+      logger.debug?.(
+        {
+          tokenId: input.tokenId,
+          entryPrice: input.entryPrice,
+        },
+        "Exit quote skipped because local orderbook is not ready",
+      );
+
+      return {
+        shouldPlace: false,
+        price: input.entryPrice,
+        size: normalizeSize(input.size),
+        quoteReason: "local-orderbook-not-ready",
+        fairValue: input.entryPrice,
+        feeRateBps,
+      };
+    }
+
     const fairValue = midpoint(book);
+    const effectiveEntryUnitCost = calculateEffectiveBuyUnitCost(input.entryPrice, feeRateBps);
     const minAggressiveExit = clampPrice(
-      input.entryPrice + env.EXIT_EDGE_BUFFER + feeComponent,
+      findRequiredExitPriceForTargetProceeds(
+        effectiveEntryUnitCost + env.EXIT_EDGE_BUFFER,
+        feeRateBps,
+        book.tickSize,
+      ),
       book.tickSize,
     );
     const minPassiveExit = clampPrice(
-      input.entryPrice + env.EXIT_EDGE_BUFFER + env.ADVERSE_SELECTION_BUFFER + feeComponent,
+      findRequiredExitPriceForTargetProceeds(
+        effectiveEntryUnitCost + env.EXIT_EDGE_BUFFER + env.ADVERSE_SELECTION_BUFFER,
+        feeRateBps,
+        book.tickSize,
+      ),
       book.tickSize,
     );
 
     if (book.bestBid !== undefined && book.bestBid >= minAggressiveExit) {
       const aggressivePrice = clampPrice(book.bestBid, book.tickSize);
 
-      logger.info({
-        tokenId: input.tokenId,
-        entryPrice: input.entryPrice,
-        bestBid: book.bestBid,
-        bestAsk: book.bestAsk,
-        fairValue,
-        feeRateBps,
-        feeComponent,
-        minAggressiveExit,
-        minPassiveExit,
-        quotePrice: aggressivePrice,
-        quoteReason: "aggressive-exit-best-bid",
-        quoteMode: "aggressive",
-      }, "Exit quote decision");
+      logger.info(
+        {
+          tokenId: input.tokenId,
+          entryPrice: input.entryPrice,
+          effectiveEntryUnitCost,
+          bestBid: book.bestBid,
+          bestAsk: book.bestAsk,
+          fairValue,
+          feeRateBps,
+          minAggressiveExit,
+          minPassiveExit,
+          quotePrice: aggressivePrice,
+          quoteReason: "aggressive-exit-best-bid",
+          quoteMode: "aggressive",
+        },
+        "Exit quote decision",
+      );
 
       return {
         shouldPlace: true,
@@ -209,20 +275,23 @@ export class QuoteEngine {
         ? clampPrice(Math.max(improvedAsk, book.bestBid + book.tickSize), book.tickSize)
         : improvedAsk;
 
-    logger.info({
-      tokenId: input.tokenId,
-      entryPrice: input.entryPrice,
-      bestBid: book.bestBid,
-      bestAsk: book.bestAsk,
-      fairValue,
-      feeRateBps,
-      feeComponent,
-      minAggressiveExit,
-      minPassiveExit,
-      quotePrice: bookAwareAsk,
-      quoteReason: "dynamic-exit-passive",
-      quoteMode: "passive",
-    }, "Exit quote decision");
+    logger.info(
+      {
+        tokenId: input.tokenId,
+        entryPrice: input.entryPrice,
+        effectiveEntryUnitCost,
+        bestBid: book.bestBid,
+        bestAsk: book.bestAsk,
+        fairValue,
+        feeRateBps,
+        minAggressiveExit,
+        minPassiveExit,
+        quotePrice: bookAwareAsk,
+        quoteReason: "dynamic-exit-passive",
+        quoteMode: "passive",
+      },
+      "Exit quote decision",
+    );
 
     return {
       shouldPlace: true,

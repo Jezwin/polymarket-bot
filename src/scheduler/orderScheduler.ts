@@ -90,6 +90,7 @@ export class OrderScheduler {
       const now = tickStartedMs;
 
       await this.positionManager?.manageOpenEntries(now);
+      await this.positionManager?.manageExpiredEntries(now);
       await this.process5mCycle(discoveredMarkets, now, tickContext);
       await this.process15mCycle(discoveredMarkets, now, tickContext);
       await this.positionManager?.manageOpenExits(now);

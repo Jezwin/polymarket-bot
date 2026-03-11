@@ -17,14 +17,14 @@ const makeTempDbPath = (): string => {
 
 const createQuoteEngine = () =>
   new QuoteEngine({
-    getOrderBookSnapshot: async () => ({
+    getSnapshot: () => ({
       tokenId: "token-1",
       bestBid: 0.48,
       bestAsk: 0.52,
       tickSize: 0.01,
       lastTradePrice: 0.5,
     }),
-    getFeeRateBps: async () => 0,
+    getFeeRateBps: () => 0,
   } as any);
 
 test("fractional exit sizes are preserved instead of being rounded down", async () => {
@@ -179,6 +179,7 @@ test("partial entry fills trigger exit handling instead of being stranded", asyn
   );
 
   const calls: Array<{ positionId: string; tokenId: string; size: number }> = [];
+  (manager as any).classifyRemainingInventory = async () => "exit";
   (manager as any).triggerExitForPosition = async (positionId: string, tokenId: string, size: number) => {
     calls.push({ positionId, tokenId, size });
   };
@@ -195,8 +196,71 @@ test("partial entry fills trigger exit handling instead of being stranded", asyn
   assert.deepEqual(calls, [{ positionId: "position-3", tokenId: "token-3", size: 2.5 }]);
 });
 
+test("expired zero-fill entry orders are cancelled and positions become entry_expired", async () => {
+  const store = new PositionStore(makeTempDbPath());
+  store.init();
+
+  store.upsertPosition({
+    positionId: "position-expired-entry",
+    conditionId: "condition-expired-entry",
+    marketId: "market-expired-entry",
+    tokenId: "token-expired-entry",
+    symbol: "BTC",
+    leg: "YES",
+    recurrence: "5m",
+    startTimeMs: 100_000,
+    endTimeMs: 400_000,
+    entryTargetPrice: 0.42,
+    entryTargetSize: 3,
+    status: "entry_open",
+    quoteReason: "initial-entry",
+  });
+  store.upsertOrder({
+    orderId: "entry-order-expired",
+    positionId: "position-expired-entry",
+    clientOrderKey: "entry:position-expired-entry",
+    tokenId: "token-expired-entry",
+    side: Side.BUY,
+    price: 0.42,
+    size: 3,
+    orderRole: "entry",
+    status: "open",
+  });
+
+  const manager = new PositionManager(
+    store,
+    {
+      getClient: () => ({
+        cancelOrder: async () => undefined,
+      }),
+    } as any,
+    {} as any,
+    {} as any,
+    {} as any,
+  );
+
+  const expirationMs = 100_000 + env.ORDER_EXPIRATION_SECONDS * 1_000;
+  await manager.manageExpiredEntries(expirationMs + 1);
+
+  const db = (store as any).db;
+  const row = db.prepare(
+    "SELECT o.status AS orderStatus, p.status AS positionStatus, p.quote_reason AS quoteReason FROM orders o INNER JOIN positions p ON p.id = o.position_id WHERE o.id = ?",
+  ).get("entry-order-expired") as
+    | {
+        orderStatus: string;
+        positionStatus: string;
+        quoteReason: string | null;
+      }
+    | undefined;
+
+  assert.ok(row);
+  assert.equal(row?.orderStatus, "cancelled");
+  assert.equal(row?.positionStatus, "entry_expired");
+  assert.equal(row?.quoteReason, "expired-unfilled-entry");
+});
+
 test("position manager exposes an active stale-exit management loop", async () => {
-  const manager = new PositionManager({ init() {} } as any, {} as any, {} as any, {} as any);
+  const manager = new PositionManager({ init() {} } as any, {} as any, {} as any, {} as any, {} as any);
   assert.equal(typeof (manager as any).manageOpenExits, "function");
 });
 
@@ -213,10 +277,12 @@ const makeMarket = () => ({
 });
 
 test("entry sizing skips orders when balance minus reserve cannot fund the minimum order size", async () => {
-  const originalReserve = env.MIN_RESERVE_USDC;
+  const originalDryRun = env.DRY_RUN;
+  const originalReserveBalance = env.RESERVE_BALANCE_USDC;
   const originalMinOrderSize = env.MIN_ORDER_SIZE;
 
-  env.MIN_RESERVE_USDC = 2;
+  env.DRY_RUN = false;
+  env.RESERVE_BALANCE_USDC = 5;
   env.MIN_ORDER_SIZE = 5;
 
   const placedOrders: Array<{ tokenID: string; size: number }> = [];
@@ -237,13 +303,22 @@ test("entry sizing skips orders when balance minus reserve cannot fund the minim
       trackOrder() {},
     } as any,
     {
+      subscribeTokens: async () => undefined,
+      getSnapshot: () => undefined,
+      getFeeRateBps: () => 0,
+    } as any,
+    {
       registerEntryOrder() {},
+      registerPendingPaperEntry() {},
     } as any,
     {
       buildEntryQuote: async (_market: unknown, leg: "YES" | "NO") =>
         leg === "YES"
           ? { shouldPlace: true, price: 1, size: 5, quoteReason: "test-reserve" }
           : { shouldPlace: false, price: 1, size: 5, quoteReason: "skip-other-leg" },
+    } as any,
+    {
+      getMockBalance: () => 6,
     } as any,
   );
 
@@ -252,16 +327,19 @@ test("entry sizing skips orders when balance minus reserve cannot fund the minim
     assert.equal(placedOrders.length, 0);
     assert.equal(result.legs[0]?.reason, "insufficient-balance-for-min-order-size");
   } finally {
-    env.MIN_RESERVE_USDC = originalReserve;
+    env.DRY_RUN = originalDryRun;
+    env.RESERVE_BALANCE_USDC = originalReserveBalance;
     env.MIN_ORDER_SIZE = originalMinOrderSize;
   }
 });
 
 test("entry sizing still allows orders when balance minus reserve can fund the minimum order size", async () => {
-  const originalReserve = env.MIN_RESERVE_USDC;
+  const originalDryRun = env.DRY_RUN;
+  const originalReserveBalance = env.RESERVE_BALANCE_USDC;
   const originalMinOrderSize = env.MIN_ORDER_SIZE;
 
-  env.MIN_RESERVE_USDC = 2;
+  env.DRY_RUN = false;
+  env.RESERVE_BALANCE_USDC = 2;
   env.MIN_ORDER_SIZE = 5;
 
   const placedOrders: Array<{ tokenID: string; size: number }> = [];
@@ -282,13 +360,22 @@ test("entry sizing still allows orders when balance minus reserve can fund the m
       trackOrder() {},
     } as any,
     {
+      subscribeTokens: async () => undefined,
+      getSnapshot: () => undefined,
+      getFeeRateBps: () => 0,
+    } as any,
+    {
       registerEntryOrder() {},
+      registerPendingPaperEntry() {},
     } as any,
     {
       buildEntryQuote: async (_market: unknown, leg: "YES" | "NO") =>
         leg === "YES"
           ? { shouldPlace: true, price: 1, size: 5, quoteReason: "test-reserve" }
           : { shouldPlace: false, price: 1, size: 5, quoteReason: "skip-other-leg" },
+    } as any,
+    {
+      getMockBalance: () => 7.2,
     } as any,
   );
 
@@ -298,7 +385,8 @@ test("entry sizing still allows orders when balance minus reserve can fund the m
     assert.equal(placedOrders[0]?.size, 5);
     assert.equal(result.legs[0]?.status, "placed");
   } finally {
-    env.MIN_RESERVE_USDC = originalReserve;
+    env.DRY_RUN = originalDryRun;
+    env.RESERVE_BALANCE_USDC = originalReserveBalance;
     env.MIN_ORDER_SIZE = originalMinOrderSize;
   }
 });

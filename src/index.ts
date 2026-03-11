@@ -4,6 +4,7 @@ import { ClobClientService } from "./services/clobClient.js";
 import { MarketDiscoveryService } from "./services/marketDiscovery.js";
 import { OrderService } from "./services/orderService.js";
 import { FillListener } from "./services/fillListener.js";
+import { MarketBookService } from "./services/marketBookService.js";
 import { PolygonWsClient } from "./services/polygonWsClient.js";
 import { PositionManager } from "./services/positionManager.js";
 import { PositionStore } from "./services/positionStore.js";
@@ -50,16 +51,25 @@ const bootstrap = async (): Promise<void> => {
 
   const polygonWsClient = new PolygonWsClient();
   await polygonWsClient.connect();
-  const quoteEngine = new QuoteEngine(clobClientService);
+  const marketBookService = new MarketBookService(clobClientService);
+  await marketBookService.connect();
+  const quoteEngine = new QuoteEngine(marketBookService);
 
-  const positionManager = new PositionManager(positionStore, clobClientService, polygonWsClient, quoteEngine);
+  const positionManager = new PositionManager(positionStore, clobClientService, marketBookService, polygonWsClient, quoteEngine);
   positionManager.init();
 
   const fillListener = new FillListener(positionManager);
 
   await fillListener.connect();
 
-  const orderService = new OrderService(clobClientService, fillListener, positionManager, quoteEngine, positionStore);
+  const orderService = new OrderService(
+    clobClientService,
+    fillListener,
+    marketBookService,
+    positionManager,
+    quoteEngine,
+    positionStore,
+  );
   positionManager.setOrderService(orderService);
 
   await positionManager.rehydrate(fillListener);
@@ -71,6 +81,7 @@ const bootstrap = async (): Promise<void> => {
     logger.info({ signal }, "Shutdown signal received");
     scheduler.stop();
     fillListener.close();
+    marketBookService.close();
     polygonWsClient.close();
     process.exit(0);
   };

@@ -103,12 +103,40 @@ export interface OrderBookSnapshot {
   lastTradePrice?: number;
 }
 
+const isMissingOrderBookError = (error: unknown): boolean => {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const record = error as {
+    message?: unknown;
+    response?: {
+      status?: unknown;
+      data?: unknown;
+    };
+  };
+
+  const status = Number(record.response?.status);
+  const message = typeof record.message === "string" ? record.message : "";
+  const responseData =
+    typeof record.response?.data === "string"
+      ? record.response.data
+      : JSON.stringify(record.response?.data ?? "");
+  const combinedMessage = `${message} ${responseData}`.toLowerCase();
+
+  return (
+    status === 404 &&
+    combinedMessage.includes("no orderbook exists for the requested token id")
+  );
+};
+
 export class ClobClientService {
   private readonly client: ClobClient;
   private readonly signerAddress: string;
   private readonly collateralTokenAddress: string;
   private readonly tickSizeCache = new Map<string, TickSize>();
   private readonly negRiskCache = new Map<string, boolean>();
+  private readonly feeRateCache = new Map<string, number>();
   private zeroBalanceHintLogged = false;
 
   constructor() {
@@ -356,9 +384,20 @@ export class ClobClientService {
     return { tickSize, negRisk };
   }
 
-  async getOrderBookSnapshot(tokenId: string): Promise<OrderBookSnapshot> {
-    const book = await withRetry(
-      () => this.client.getOrderBook(tokenId),
+  async getOrderBookSummary(tokenId: string): Promise<OrderBookSummary | null> {
+    return withRetry(
+      async () => {
+        try {
+          return await this.client.getOrderBook(tokenId);
+        } catch (error) {
+          if (isMissingOrderBookError(error)) {
+            logger.debug?.({ tokenId }, "Orderbook not yet active, skipping");
+            return null;
+          }
+
+          throw error;
+        }
+      },
       {
         attempts: env.MAX_RETRIES,
         baseDelayMs: env.RETRY_BASE_DELAY_MS,
@@ -376,13 +415,26 @@ export class ClobClientService {
         },
       },
     );
+  }
+
+  async getOrderBookSnapshot(tokenId: string): Promise<OrderBookSnapshot | null> {
+    const book = await this.getOrderBookSummary(tokenId);
+
+    if (book === null) {
+      return null;
+    }
 
     return this.parseOrderBookSnapshot(tokenId, book);
   }
 
   async getFeeRateBps(tokenId: string): Promise<number> {
+    const cached = this.feeRateCache.get(tokenId);
+    if (cached !== undefined) {
+      return cached;
+    }
+
     try {
-      return await withRetry(
+      const feeRateBps = await withRetry(
         () => this.client.getFeeRateBps(tokenId),
         {
           attempts: env.MAX_RETRIES,
@@ -390,9 +442,19 @@ export class ClobClientService {
           label: "fee-rate",
         },
       );
+      this.feeRateCache.set(tokenId, feeRateBps);
+      return feeRateBps;
     } catch {
       return env.DEFAULT_FEE_RATE_BPS;
     }
+  }
+
+  setCachedFeeRateBps(tokenId: string, feeRateBps: number): void {
+    if (!Number.isFinite(feeRateBps) || feeRateBps < 0) {
+      return;
+    }
+
+    this.feeRateCache.set(tokenId, feeRateBps);
   }
 
   private parseOrderBookSnapshot(tokenId: string, book: OrderBookSummary): OrderBookSnapshot {

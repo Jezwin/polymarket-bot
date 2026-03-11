@@ -6,6 +6,7 @@ import { env } from "../config/env.js";
 export type PersistedPositionStatus =
   | "entry_pending"
   | "entry_open"
+  | "entry_expired"
   | "partially_filled"
   | "fully_filled"
   | "exit_pending"
@@ -65,6 +66,20 @@ export interface PersistedOrderForTracking {
   startTimeMs: number;
   endTimeMs: number;
   price: number;
+}
+
+export interface PersistedOpenEntryOrder {
+  orderId: string;
+  positionId: string;
+  tokenId: string;
+  recurrence: string;
+  startTimeMs: number;
+  endTimeMs: number;
+  price: number;
+  size: number;
+  matchedSize: number;
+  filledSize: number;
+  status: PersistedPositionStatus;
 }
 
 export interface PersistedExitCandidate {
@@ -392,6 +407,32 @@ export class PositionStore {
       .all() as PersistedOrderForTracking[];
   }
 
+  getActiveZeroFillEntryOrders(): PersistedOpenEntryOrder[] {
+    return this.db
+      .prepare(`
+        SELECT
+          o.id AS orderId,
+          o.position_id AS positionId,
+          o.token_id AS tokenId,
+          p.recurrence AS recurrence,
+          p.start_time_ms AS startTimeMs,
+          p.end_time_ms AS endTimeMs,
+          o.price AS price,
+          o.size AS size,
+          o.matched_size AS matchedSize,
+          p.filled_size AS filledSize,
+          p.status AS status
+        FROM orders o
+        INNER JOIN positions p ON p.id = o.position_id
+        WHERE o.order_role = 'entry'
+          AND o.status IN ('open', 'pending_submit', 'partially_filled')
+          AND p.status IN ('entry_pending', 'entry_open', 'partially_filled')
+          AND o.matched_size = 0
+          AND p.filled_size = 0
+      `)
+      .all() as PersistedOpenEntryOrder[];
+  }
+
   getExitCandidates(): PersistedExitCandidate[] {
     return this.db
       .prepare(`
@@ -643,6 +684,16 @@ export class PositionStore {
         WHERE id = ?
       `)
       .run(status, Date.now(), positionId);
+  }
+
+  markEntryExpired(positionId: string, reason: string): void {
+    this.db
+      .prepare(`
+        UPDATE positions
+        SET status = 'entry_expired', quote_reason = ?, updated_at_ms = ?
+        WHERE id = ?
+      `)
+      .run(reason, Date.now(), positionId);
   }
 
   getMockBalance(startingBalance = 5): number {
