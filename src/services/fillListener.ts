@@ -19,6 +19,7 @@ export class FillListener {
     private isConnected = false;
     private ws: WebSocket | null = null;
     private activeOrders = new Map<string, TrackedOrder>();
+    private subscribedTokens = new Set<string>();
 
     constructor(
         private readonly positionManager: PositionManager
@@ -73,7 +74,9 @@ export class FillListener {
     }
 
     public subscribeToTokens(tokenIds: string[]): void {
-        // Obsolete in user channel model
+        for (const tokenId of tokenIds) {
+            this.subscribedTokens.add(tokenId);
+        }
     }
 
     public trackOrder(orderId: string, tokenId: string, size: number, side: Side, matchedSize = 0) {
@@ -112,17 +115,41 @@ export class FillListener {
         // Polymarket user channel events use 'event_type' instead of 'type' for fills
         if (msg.event_type !== "trade" && msg.event_type !== "order") return;
 
+        if (msg.event_type === "trade") {
+            this.handleTrade(msg);
+            return;
+        }
+
         this.handleFill(msg);
+    }
+
+    private handleTrade(msg: any) {
+        if (!env.DRY_RUN) {
+            return;
+        }
+
+        const tokenId = this.extractTradeTokenId(msg);
+        const price = this.extractTradePrice(msg);
+        if (!tokenId || price === undefined || !this.subscribedTokens.has(tokenId)) {
+            return;
+        }
+
+        const eventTimeMs = this.extractEventTimeMs(msg);
+        logger.debug?.(
+            { tokenId, price, eventTimeMs },
+            "Forwarding live trade for DRY_RUN paper order validation",
+        );
+
+        void this.positionManager.onDryRunMarketTrade({
+            tokenId,
+            price,
+            eventTimeMs,
+        });
     }
 
     private handleFill(msg: any) {
         let orderId = "";
         let fillSize = 0;
-
-        // Order updates are the canonical fill source because size_matched is cumulative.
-        if (msg.event_type === "trade") {
-            return;
-        }
 
         if (msg.event_type === "order") {
             orderId = msg.id;
@@ -183,6 +210,73 @@ export class FillListener {
         }
     }
 
+    private extractTradeTokenId(msg: any): string | undefined {
+        const candidates = [
+            msg?.asset_id,
+            msg?.assetId,
+            msg?.token_id,
+            msg?.tokenId,
+            msg?.tokenID,
+            msg?.maker_asset_id,
+            msg?.makerAssetId,
+            msg?.taker_asset_id,
+            msg?.takerAssetId,
+        ];
+
+        for (const candidate of candidates) {
+            if (typeof candidate === "string" && candidate.trim().length > 0) {
+                return candidate;
+            }
+        }
+
+        return undefined;
+    }
+
+    private extractTradePrice(msg: any): number | undefined {
+        const candidates = [
+            msg?.price,
+            msg?.trade_price,
+            msg?.tradePrice,
+            msg?.last_trade_price,
+            msg?.lastTradePrice,
+            msg?.maker_price,
+            msg?.makerPrice,
+            msg?.taker_price,
+            msg?.takerPrice,
+        ];
+
+        for (const candidate of candidates) {
+            const parsed = Number(candidate);
+            if (Number.isFinite(parsed) && parsed > 0) {
+                return parsed;
+            }
+        }
+
+        return undefined;
+    }
+
+    private extractEventTimeMs(msg: any): number {
+        const raw = msg?.timestamp ?? msg?.time ?? msg?.created_at ?? msg?.createdAt;
+
+        if (typeof raw === "number" && Number.isFinite(raw)) {
+            return raw > 1_000_000_000_000 ? raw : raw * 1_000;
+        }
+
+        if (typeof raw === "string" && raw.trim().length > 0) {
+            const numeric = Number(raw);
+            if (Number.isFinite(numeric)) {
+                return numeric > 1_000_000_000_000 ? numeric : numeric * 1_000;
+            }
+
+            const parsed = Date.parse(raw);
+            if (Number.isFinite(parsed)) {
+                return parsed;
+            }
+        }
+
+        return Date.now();
+    }
+
     public close(): void {
         this.isConnected = false;
         if (this.ws) {
@@ -190,5 +284,6 @@ export class FillListener {
             this.ws = null;
         }
         this.activeOrders.clear();
+        this.subscribedTokens.clear();
     }
 }

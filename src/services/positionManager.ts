@@ -37,8 +37,47 @@ interface FillProgressInput {
   targetSize: number;
 }
 
+interface SyntheticFillProgressInput extends FillProgressInput {
+  eventSource: string;
+  eventTimeMs: number;
+}
+
+interface PendingPaperExit {
+  orderId: string;
+  positionId: string;
+  tokenId: string;
+  size: number;
+  targetPrice: number;
+  exitReason: string;
+}
+
+interface PendingPaperEntry {
+  orderId: string;
+  positionId: string;
+  conditionId: string;
+  marketId: string;
+  tokenId: string;
+  marketName: string;
+  symbol: string;
+  leg: string;
+  recurrence: string;
+  size: number;
+  targetPrice: number;
+  quoteReason: string;
+  schedulerTickId: string;
+  schedulerCycleLabel: string;
+  schedulerTickStartedMs: number;
+  schedulerExpectedIntervalMs: number;
+  schedulerActualIntervalMs?: number;
+  targetCycleStartMs: number;
+}
+
+const PRICE_MATCH_EPSILON = 1e-9;
+
 export class PositionManager {
   private readonly exitInFlight = new Set<string>();
+  private readonly pendingPaperEntries = new Map<string, PendingPaperEntry>();
+  private readonly pendingPaperExits = new Map<string, PendingPaperExit>();
   private orderService: OrderService | null = null;
 
   constructor(
@@ -182,13 +221,119 @@ export class PositionManager {
     );
   }
 
+  async simulateOrderFill(input: SyntheticFillProgressInput): Promise<void> {
+    await this.applyFillProgress(input, input.eventSource, input.eventTimeMs);
+  }
+
   async onOrderFillProgress(input: FillProgressInput): Promise<void> {
+    await this.applyFillProgress(input, "polymarket-user-ws", Date.now());
+  }
+
+  async onDryRunMarketTrade(input: {
+    tokenId: string;
+    price: number;
+    eventTimeMs: number;
+  }): Promise<void> {
+    if (!env.DRY_RUN) {
+      return;
+    }
+
+    const matchingEntries = [...this.pendingPaperEntries.values()].filter(
+      (order) => order.tokenId === input.tokenId && input.price <= order.targetPrice + PRICE_MATCH_EPSILON,
+    );
+    const matchingExits = [...this.pendingPaperExits.values()].filter(
+      (order) => order.tokenId === input.tokenId && input.price + PRICE_MATCH_EPSILON >= order.targetPrice,
+    );
+
+    for (const pendingOrder of matchingEntries) {
+      if (!this.pendingPaperEntries.delete(pendingOrder.orderId)) {
+        continue;
+      }
+
+      await this.completePendingPaperEntry(pendingOrder, input.eventTimeMs, "paper-trade-cross");
+    }
+
+    for (const pendingOrder of matchingExits) {
+      if (!this.pendingPaperExits.delete(pendingOrder.orderId)) {
+        continue;
+      }
+
+      await this.completePendingPaperExit(pendingOrder, input.eventTimeMs, "paper-trade-cross");
+    }
+  }
+
+  registerPendingPaperEntry(input: PendingPaperEntry): void {
+    this.pendingPaperEntries.set(input.orderId, input);
+
+    logger.info(
+      {
+        orderId: input.orderId,
+        positionId: input.positionId,
+        tokenId: input.tokenId,
+        targetPrice: input.targetPrice,
+        size: input.size,
+        quoteReason: input.quoteReason,
+      },
+      "Registered pending paper entry order",
+    );
+  }
+
+  async manageOpenEntries(now = Date.now()): Promise<void> {
+    if (!env.DRY_RUN || this.pendingPaperEntries.size === 0) {
+      return;
+    }
+
+    const pendingEntriesByToken = new Map<string, PendingPaperEntry[]>();
+    for (const pendingEntry of this.pendingPaperEntries.values()) {
+      const existing = pendingEntriesByToken.get(pendingEntry.tokenId);
+      if (existing) {
+        existing.push(pendingEntry);
+      } else {
+        pendingEntriesByToken.set(pendingEntry.tokenId, [pendingEntry]);
+      }
+    }
+
+    for (const [tokenId, pendingEntries] of pendingEntriesByToken.entries()) {
+      try {
+        const book = await this.clobClientService.getOrderBookSnapshot(tokenId);
+        if (book.bestAsk === undefined) {
+          continue;
+        }
+
+        const fillableEntries = pendingEntries.filter(
+          (entry) => book.bestAsk !== undefined && book.bestAsk <= entry.targetPrice + PRICE_MATCH_EPSILON,
+        );
+
+        for (const pendingEntry of fillableEntries) {
+          if (!this.pendingPaperEntries.delete(pendingEntry.orderId)) {
+            continue;
+          }
+
+          await this.completePendingPaperEntry(pendingEntry, now, "paper-orderbook-cross");
+        }
+      } catch (error) {
+        logger.warn(
+          {
+            tokenId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          "Failed to validate pending paper entry against live order book",
+        );
+      }
+    }
+  }
+
+  private async applyFillProgress(
+    input: FillProgressInput,
+    eventSource: string,
+    eventTimeMs: number,
+  ): Promise<void> {
     const update = this.store.recordFillProgress({
       orderId: input.orderId,
       fillSize: input.fillSize,
       cumulativeMatchedSize: input.cumulativeMatchedSize,
-      eventSource: "polymarket-user-ws",
-      eventTimeMs: Date.now(),
+      eventSource,
+      eventTimeMs,
     });
 
     if (!update) {
@@ -209,6 +354,7 @@ export class PositionManager {
     }
 
     if (update.orderRole === "exit" && input.side === Side.SELL) {
+      this.pendingPaperExits.delete(input.orderId);
       await this.classifyRemainingInventory(update.positionId, input.tokenId, update.positionFilledSize, input.orderId);
     }
   }
@@ -275,7 +421,20 @@ export class PositionManager {
         price: replacementPrice,
         size: quote.size,
       });
-      this.store.markExitReason(openExit.positionId, nearDeadline ? "forced-unwind" : quote.quoteReason);
+      const exitReason = nearDeadline ? "forced-unwind" : quote.quoteReason;
+      this.store.markExitReason(openExit.positionId, exitReason);
+
+      if (env.DRY_RUN) {
+        await this.handleDryRunExitOrder({
+          orderId: replacementOrderId,
+          positionId: openExit.positionId,
+          tokenId: openExit.tokenId,
+          size: quote.size,
+          price: replacementPrice,
+          bestBid: quote.bestBid,
+          exitReason,
+        });
+      }
 
       logger.info(
         {
@@ -334,7 +493,7 @@ export class PositionManager {
       return;
     }
 
-    if (entryOrderId) {
+    if (entryOrderId && !env.DRY_RUN) {
       try {
         await this.polygonWsClient.awaitOrderFill(entryOrderId);
       } catch (error) {
@@ -365,6 +524,18 @@ export class PositionManager {
         size: quote.size,
       });
       this.store.markExitReason(positionId, quote.quoteReason);
+
+      if (env.DRY_RUN) {
+        await this.handleDryRunExitOrder({
+          orderId,
+          positionId,
+          tokenId,
+          size: quote.size,
+          price: quote.price,
+          bestBid: quote.bestBid,
+          exitReason: quote.quoteReason,
+        });
+      }
 
       const updatedPosition = this.store.getPositionForExit(positionId);
       logger.info(
@@ -398,6 +569,13 @@ export class PositionManager {
   }
 
   private async cancelOrder(orderId: string, nextStatus: "cancelled" | "failed"): Promise<boolean> {
+    if (env.DRY_RUN && orderId.startsWith("paper:")) {
+      this.pendingPaperEntries.delete(orderId);
+      this.pendingPaperExits.delete(orderId);
+      this.store.markOrderStatus(orderId, nextStatus);
+      return true;
+    }
+
     try {
       await this.clobClientService.getClient().cancelOrder({ orderID: orderId } as any);
       this.store.markOrderStatus(orderId, nextStatus);
@@ -417,6 +595,149 @@ export class PositionManager {
       logger.warn({ orderId, error: message }, "Failed to cancel order during lifecycle management");
       return false;
     }
+  }
+
+  private async handleDryRunExitOrder(input: {
+    orderId: string;
+    positionId: string;
+    tokenId: string;
+    size: number;
+    price: number;
+    bestBid?: number;
+    exitReason: string;
+  }): Promise<void> {
+    if (input.bestBid !== undefined && input.price <= input.bestBid + 1e-9) {
+      await this.completePendingPaperExit(
+        {
+          orderId: input.orderId,
+          positionId: input.positionId,
+          tokenId: input.tokenId,
+          size: input.size,
+          targetPrice: input.price,
+          exitReason: input.exitReason,
+        },
+        Date.now(),
+        "paper-exit",
+      );
+      return;
+    }
+
+    this.pendingPaperExits.set(input.orderId, {
+      orderId: input.orderId,
+      positionId: input.positionId,
+      tokenId: input.tokenId,
+      size: input.size,
+      targetPrice: input.price,
+      exitReason: input.exitReason,
+    });
+
+    logger.info(
+      {
+        orderId: input.orderId,
+        positionId: input.positionId,
+        tokenId: input.tokenId,
+        targetPrice: input.price,
+        size: input.size,
+        exitReason: input.exitReason,
+      },
+      "Registered pending paper exit order",
+    );
+  }
+
+  private async completePendingPaperEntry(
+    pendingOrder: PendingPaperEntry,
+    eventTimeMs: number,
+    eventSource: string,
+  ): Promise<void> {
+    this.store.upsertPaperTradeEntry({
+      positionId: pendingOrder.positionId,
+      conditionId: pendingOrder.conditionId,
+      marketId: pendingOrder.marketId,
+      tokenId: pendingOrder.tokenId,
+      marketName: pendingOrder.marketName,
+      symbol: pendingOrder.symbol,
+      leg: pendingOrder.leg,
+      recurrence: pendingOrder.recurrence,
+      schedulerTickId: pendingOrder.schedulerTickId,
+      schedulerCycleLabel: pendingOrder.schedulerCycleLabel,
+      schedulerTickStartedMs: pendingOrder.schedulerTickStartedMs,
+      schedulerExpectedIntervalMs: pendingOrder.schedulerExpectedIntervalMs,
+      schedulerActualIntervalMs: pendingOrder.schedulerActualIntervalMs,
+      targetCycleStartMs: pendingOrder.targetCycleStartMs,
+      entryQuotePrice: pendingOrder.targetPrice,
+      entryFillPrice: pendingOrder.targetPrice,
+      entrySize: pendingOrder.size,
+      quoteReason: pendingOrder.quoteReason,
+      entryTimeMs: eventTimeMs,
+    });
+
+    await this.simulateOrderFill({
+      orderId: pendingOrder.orderId,
+      tokenId: pendingOrder.tokenId,
+      side: Side.BUY,
+      fillSize: pendingOrder.size,
+      cumulativeMatchedSize: pendingOrder.size,
+      targetSize: pendingOrder.size,
+      eventSource,
+      eventTimeMs,
+    });
+
+    logger.info(
+      {
+        orderId: pendingOrder.orderId,
+        positionId: pendingOrder.positionId,
+        tokenId: pendingOrder.tokenId,
+        targetPrice: pendingOrder.targetPrice,
+        eventSource,
+        eventTimeMs,
+      },
+      "Completed pending paper entry order",
+    );
+  }
+
+  private async completePendingPaperExit(
+    pendingOrder: PendingPaperExit,
+    eventTimeMs: number,
+    eventSource: string,
+  ): Promise<void> {
+    await this.simulateOrderFill({
+      orderId: pendingOrder.orderId,
+      tokenId: pendingOrder.tokenId,
+      side: Side.SELL,
+      fillSize: pendingOrder.size,
+      cumulativeMatchedSize: pendingOrder.size,
+      targetSize: pendingOrder.size,
+      eventSource,
+      eventTimeMs,
+    });
+
+    const paperExitPosition = this.store.getPositionForExit(pendingOrder.positionId);
+    this.store.finalizePaperTradeExit({
+      positionId: pendingOrder.positionId,
+      exitQuotePrice: pendingOrder.targetPrice,
+      exitFillPrice: pendingOrder.targetPrice,
+      exitSize: pendingOrder.size,
+      exitReason: pendingOrder.exitReason,
+      exitTimeMs: eventTimeMs,
+      holdingTimeMs:
+        paperExitPosition?.entryFillTimeMs && paperExitPosition?.exitFillTimeMs
+          ? paperExitPosition.exitFillTimeMs - paperExitPosition.entryFillTimeMs
+          : null,
+      realizedSpread: paperExitPosition?.realizedSpread,
+      realizedPnl: paperExitPosition?.realizedPnl,
+    });
+
+    logger.info(
+      {
+        orderId: pendingOrder.orderId,
+        positionId: pendingOrder.positionId,
+        tokenId: pendingOrder.tokenId,
+        targetPrice: pendingOrder.targetPrice,
+        eventSource,
+        eventTimeMs,
+      },
+      "Completed pending paper exit order",
+    );
   }
 
   private async classifyRemainingInventory(

@@ -1,4 +1,5 @@
 import { OrderType, Side, type OpenOrder } from "@polymarket/clob-client";
+import { randomUUID } from "node:crypto";
 import { env } from "../config/env.js";
 import type { DiscoveredMarket } from "../types/market.js";
 import type { MarketLeg, TrackedOrder } from "../types/order.js";
@@ -9,6 +10,7 @@ import { ClobClientService } from "./clobClient.js";
 import type { FillListener } from "./fillListener.js";
 import type { MarketDiscoveryService } from "./marketDiscovery.js";
 import type { PositionManager } from "./positionManager.js";
+import type { PositionStore } from "./positionStore.js";
 import { QuoteEngine } from "./quoteEngine.js";
 import { notify } from "../utils/notify.js";
 
@@ -36,6 +38,15 @@ export interface PlaceOrdersForMarketResult {
   marketId: string;
   conditionId: string;
   legs: PlacementLegResult[];
+}
+
+export interface PaperTradeSchedulerContext {
+  tickId: string;
+  cycleLabel: "5m" | "15m";
+  schedulerTickStartedMs: number;
+  schedulerExpectedIntervalMs: number;
+  schedulerActualIntervalMs?: number;
+  targetCycleStartMs: number;
 }
 
 const PRICE_TOLERANCE = 1e-9;
@@ -92,10 +103,15 @@ export class OrderService {
     private readonly fillListener: FillListener,
     private readonly positionManager: PositionManager,
     private readonly quoteEngine: QuoteEngine,
+    private readonly positionStore: PositionStore,
   ) { }
 
   private makePlacementKey(marketId: string, tokenId: string, price: number, size: number): string {
     return `${marketId}:${tokenId}:${price}:${size}`;
+  }
+
+  private makePaperOrderId(role: "entry" | "exit", tokenId: string): string {
+    return `paper:${role}:${tokenId}:${Date.now()}:${randomUUID()}`;
   }
 
   hydrateTrackedEntryOrder(
@@ -169,7 +185,18 @@ export class OrderService {
     return maxStartTimeMs;
   }
 
-  async placeOrdersForMarket(market: DiscoveredMarket): Promise<PlaceOrdersForMarketResult> {
+  completePaperTick(tickId: string, completedAtMs: number): void {
+    if (!env.DRY_RUN) {
+      return;
+    }
+
+    this.positionStore.finalizePaperSchedulerTick(tickId, completedAtMs);
+  }
+
+  async placeOrdersForMarket(
+    market: DiscoveredMarket,
+    paperContext?: PaperTradeSchedulerContext,
+  ): Promise<PlaceOrdersForMarketResult> {
     const client = this.clobClientService.getClient();
     const entryQuotes = await Promise.all([
       this.quoteEngine.buildEntryQuote(market, "YES", market.yesTokenId),
@@ -195,16 +222,23 @@ export class OrderService {
     const tokenIdsToWatch = desiredOrders.map(d => d.tokenId);
     this.fillListener.subscribeToTokens(tokenIdsToWatch);
 
-    const balanceSnapshot = await this.clobClientService.getBalanceSnapshot();
-    const tradableBalance = balanceSnapshot.balanceUsdc - env.RESERVE_BALANCE_USDC;
+    const balanceSource = env.DRY_RUN ? "paper-mock" : "live";
+    const reserveBalanceUsdc = env.DRY_RUN ? 0 : env.RESERVE_BALANCE_USDC;
+    const availableUsdc = env.DRY_RUN
+      ? this.positionStore.getMockBalance(5)
+      : (await this.clobClientService.getBalanceSnapshot()).balanceUsdc;
+    const tradableBalance = env.DRY_RUN
+      ? availableUsdc
+      : availableUsdc - reserveBalanceUsdc;
     if (tradableBalance <= 0) {
       logger.warn(
         {
           marketId: market.marketId,
           conditionId: market.conditionId,
-          availableUsdc: balanceSnapshot.balanceUsdc,
-          reserveBalanceUsdc: env.RESERVE_BALANCE_USDC,
+          availableUsdc,
+          reserveBalanceUsdc,
           tradableBalance,
+          balanceSource,
         },
         "Skipped entry placement: Account balance is at or below the reserve limit.",
       );
@@ -242,9 +276,10 @@ export class OrderService {
             conditionId: market.conditionId,
             tokenId: desired.tokenId,
             leg: desired.leg,
-            availableUsdc: balanceSnapshot.balanceUsdc,
+            availableUsdc,
             tradableBalance: remainingUsdc,
-            reserveBalanceUsdc: env.RESERVE_BALANCE_USDC,
+            reserveBalanceUsdc,
+            balanceSource,
             quotePrice: desired.price,
             targetSize: desired.size,
             maxAffordableSize: roundOrderSize(maxAffordableSize),
@@ -265,35 +300,38 @@ export class OrderService {
         {
           marketId: market.marketId,
           conditionId: market.conditionId,
-          availableUsdc: balanceSnapshot.balanceUsdc,
+          availableUsdc,
           tradableBalance,
           minOrderSize: env.MIN_ORDER_SIZE,
-          reserveBalanceUsdc: env.RESERVE_BALANCE_USDC,
+          reserveBalanceUsdc,
+          balanceSource,
         },
         "Skipping market placement because no entry legs are affordable",
       );
     }
 
-    const openOrders = await withRetry(
-      () => client.getOpenOrders({ market: market.conditionId }),
-      {
-        attempts: env.MAX_RETRIES,
-        baseDelayMs: env.RETRY_BASE_DELAY_MS,
-        label: "get-open-orders",
-        onRetry: (attempt, error, delayMs) => {
-          logger.warn(
-            {
-              marketId: market.marketId,
-              conditionId: market.conditionId,
-              attempt,
-              delayMs,
-              error: error instanceof Error ? error.message : String(error),
-            },
-            "Failed to fetch open orders; retrying",
-          );
+    const openOrders: OpenOrder[] = env.DRY_RUN
+      ? []
+      : await withRetry(
+        () => client.getOpenOrders({ market: market.conditionId }),
+        {
+          attempts: env.MAX_RETRIES,
+          baseDelayMs: env.RETRY_BASE_DELAY_MS,
+          label: "get-open-orders",
+          onRetry: (attempt, error, delayMs) => {
+            logger.warn(
+              {
+                marketId: market.marketId,
+                conditionId: market.conditionId,
+                attempt,
+                delayMs,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Failed to fetch open orders; retrying",
+            );
+          },
         },
-      },
-    );
+      );
 
     const trackedOrders: TrackedOrder[] = [];
     const legResults: PlacementLegResult[] = [];
@@ -390,6 +428,83 @@ export class OrderService {
       this.placementKeys.add(placementKey);
 
       try {
+        if (env.DRY_RUN) {
+          const orderId = this.makePaperOrderId("entry", desired.tokenId);
+          const entrySubmittedAtMs = Date.now();
+          const positionId = `${market.conditionId}:${desired.tokenId}`;
+
+          trackedOrders.push({
+            orderId,
+            marketId: market.marketId,
+            conditionId: market.conditionId,
+            tokenId: desired.tokenId,
+            price: desired.price,
+            size: desired.size,
+            leg: desired.leg,
+          });
+
+          logger.info(
+            {
+              marketId: market.marketId,
+              conditionId: market.conditionId,
+              orderId,
+              tokenId: desired.tokenId,
+              leg: desired.leg,
+              price: desired.price,
+              size: desired.size,
+              quoteReason: desired.quoteReason,
+            },
+            "Paper entry order registered for pending market validation",
+          );
+
+          legResults.push({
+            leg: desired.leg,
+            tokenId: desired.tokenId,
+            status: "placed",
+            orderId,
+          });
+
+          this.positionManager.registerEntryOrder({
+            orderId,
+            clientOrderKey: placementKey,
+            conditionId: market.conditionId,
+            marketId: market.marketId,
+            tokenId: desired.tokenId,
+            symbol: market.symbol,
+            leg: desired.leg,
+            recurrence: market.recurrence,
+            startTimeMs: toUtcMillis(market.startTime),
+            endTimeMs: toUtcMillis(market.endTime),
+            price: desired.price,
+            size: desired.size,
+            quoteReason: desired.quoteReason,
+          });
+
+          this.positionManager.registerPendingPaperEntry({
+            orderId,
+            positionId,
+            conditionId: market.conditionId,
+            marketId: market.marketId,
+            tokenId: desired.tokenId,
+            marketName: market.question,
+            symbol: market.symbol,
+            leg: desired.leg,
+            recurrence: market.recurrence,
+            size: desired.size,
+            targetPrice: desired.price,
+            schedulerTickId: paperContext?.tickId ?? `paper-tick:${entrySubmittedAtMs}`,
+            schedulerCycleLabel: paperContext?.cycleLabel ?? market.recurrence,
+            schedulerTickStartedMs: paperContext?.schedulerTickStartedMs ?? entrySubmittedAtMs,
+            schedulerExpectedIntervalMs:
+              paperContext?.schedulerExpectedIntervalMs ?? env.MARKET_POLL_INTERVAL_SECONDS * 1_000,
+            schedulerActualIntervalMs: paperContext?.schedulerActualIntervalMs,
+            targetCycleStartMs: paperContext?.targetCycleStartMs ?? toUtcMillis(market.startTime),
+            quoteReason: desired.quoteReason,
+          });
+
+          continue;
+        }
+
         const creationConfig = await this.clobClientService.getOrderCreationConfig(desired.tokenId);
         let expirationTs: number;
         if (market.recurrence === "15m") {
@@ -522,8 +637,10 @@ export class OrderService {
       };
     }
 
-    for (const order of trackedOrders) {
-      this.fillListener.trackOrder(order.orderId, order.tokenId, order.size, Side.BUY);
+    if (!env.DRY_RUN) {
+      for (const order of trackedOrders) {
+        this.fillListener.trackOrder(order.orderId, order.tokenId, order.size, Side.BUY);
+      }
     }
 
     return {
@@ -534,8 +651,6 @@ export class OrderService {
   }
 
   async placeSellOrder(tokenId: string, price: number, size: number, positionId?: string): Promise<string> {
-    const client = this.clobClientService.getClient();
-
     const marketDetails = this.tokenToMarketDetails.get(tokenId);
     let expirationTs: number;
 
@@ -551,9 +666,17 @@ export class OrderService {
       logger.warn({ tokenId }, "Market details not found for token id, using fallback expiration");
     }
 
-    const creationConfig = await this.clobClientService.getOrderCreationConfig(tokenId);
-
     logger.info({ tokenId, price, size, expirationTs, positionId }, "Placing SELL limit order");
+
+    if (env.DRY_RUN) {
+      this.fillListener.subscribeToTokens([tokenId]);
+      const orderId = this.makePaperOrderId("exit", tokenId);
+      logger.info({ orderId, tokenId, price, size, positionId }, "Paper SELL order simulated");
+      return orderId;
+    }
+
+    const client = this.clobClientService.getClient();
+    const creationConfig = await this.clobClientService.getOrderCreationConfig(tokenId);
 
     const response = await withRetry(
       () =>

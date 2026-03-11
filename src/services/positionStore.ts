@@ -122,6 +122,40 @@ interface FillUpdateResult {
   positionStatus: PersistedPositionStatus;
 }
 
+interface UpsertPaperTradeEntryInput {
+  positionId: string;
+  conditionId: string;
+  marketId: string;
+  tokenId: string;
+  marketName: string;
+  symbol: string;
+  leg: string;
+  recurrence: string;
+  schedulerTickId: string;
+  schedulerCycleLabel: string;
+  schedulerTickStartedMs: number;
+  schedulerExpectedIntervalMs: number;
+  schedulerActualIntervalMs?: number;
+  targetCycleStartMs: number;
+  entryQuotePrice: number;
+  entryFillPrice: number;
+  entrySize: number;
+  quoteReason: string;
+  entryTimeMs: number;
+}
+
+interface FinalizePaperTradeExitInput {
+  positionId: string;
+  exitQuotePrice: number;
+  exitFillPrice: number;
+  exitSize: number;
+  exitReason: string;
+  exitTimeMs: number;
+  holdingTimeMs?: number | null;
+  realizedSpread?: number | null;
+  realizedPnl?: number | null;
+}
+
 export class PositionStore {
   private readonly db: Database.Database;
 
@@ -190,9 +224,46 @@ export class PositionStore {
         FOREIGN KEY(order_id) REFERENCES orders(id)
       );
 
+      CREATE TABLE IF NOT EXISTS paper_trades (
+        id TEXT PRIMARY KEY,
+        position_id TEXT NOT NULL UNIQUE,
+        condition_id TEXT NOT NULL,
+        market_id TEXT NOT NULL,
+        token_id TEXT NOT NULL,
+        market_name TEXT,
+        symbol TEXT NOT NULL,
+        leg TEXT NOT NULL,
+        recurrence TEXT NOT NULL,
+        scheduler_tick_id TEXT NOT NULL,
+        scheduler_cycle_label TEXT NOT NULL,
+        scheduler_tick_started_ms INTEGER NOT NULL,
+        scheduler_tick_completed_ms INTEGER,
+        scheduler_expected_interval_ms INTEGER NOT NULL,
+        scheduler_actual_interval_ms INTEGER,
+        target_cycle_start_ms INTEGER NOT NULL,
+        entry_quote_price REAL NOT NULL,
+        entry_fill_price REAL NOT NULL,
+        entry_size REAL NOT NULL,
+        quote_reason TEXT NOT NULL,
+        entry_time_ms INTEGER NOT NULL,
+        exit_quote_price REAL,
+        exit_fill_price REAL,
+        exit_size REAL,
+        exit_reason TEXT,
+        exit_time_ms INTEGER,
+        holding_time_ms INTEGER,
+        realized_spread REAL,
+        realized_pnl REAL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        FOREIGN KEY(position_id) REFERENCES positions(id)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_orders_position_id ON orders(position_id);
       CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
       CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+      CREATE INDEX IF NOT EXISTS idx_paper_trades_entry_time_ms ON paper_trades(entry_time_ms);
+      CREATE INDEX IF NOT EXISTS idx_paper_trades_scheduler_tick_id ON paper_trades(scheduler_tick_id);
     `);
 
     this.ensureColumn("positions", "entry_price_actual", "REAL");
@@ -203,6 +274,7 @@ export class PositionStore {
     this.ensureColumn("positions", "exit_fill_time_ms", "INTEGER");
     this.ensureColumn("positions", "quote_reason", "TEXT");
     this.ensureColumn("positions", "exit_reason", "TEXT");
+    this.ensureColumn("paper_trades", "market_name", "TEXT");
   }
 
   private ensureColumn(tableName: string, columnName: string, columnDefinition: string): void {
@@ -571,6 +643,155 @@ export class PositionStore {
         WHERE id = ?
       `)
       .run(status, Date.now(), positionId);
+  }
+
+  getMockBalance(startingBalance = 5): number {
+    const totals = this.db
+      .prepare(`
+        SELECT
+          COALESCE(SUM(entry_fill_price * entry_size), 0) AS total_entry_notional,
+          COALESCE(
+            SUM(
+              CASE
+                WHEN exit_fill_price IS NOT NULL AND exit_size IS NOT NULL
+                  THEN exit_fill_price * exit_size
+                ELSE 0
+              END
+            ),
+            0
+          ) AS total_exit_notional
+        FROM paper_trades
+      `)
+      .get() as
+      | {
+        total_entry_notional?: number | null;
+        total_exit_notional?: number | null;
+      }
+      | undefined;
+
+    const totalEntryNotional = Number(totals?.total_entry_notional ?? 0);
+    const totalExitNotional = Number(totals?.total_exit_notional ?? 0);
+
+    return Number((startingBalance - totalEntryNotional + totalExitNotional).toFixed(4));
+  }
+
+  upsertPaperTradeEntry(input: UpsertPaperTradeEntryInput): void {
+    const now = Date.now();
+    this.db
+      .prepare(`
+        INSERT INTO paper_trades (
+          id,
+          position_id,
+          condition_id,
+          market_id,
+          token_id,
+          market_name,
+          symbol,
+          leg,
+          recurrence,
+          scheduler_tick_id,
+          scheduler_cycle_label,
+          scheduler_tick_started_ms,
+          scheduler_expected_interval_ms,
+          scheduler_actual_interval_ms,
+          target_cycle_start_ms,
+          entry_quote_price,
+          entry_fill_price,
+          entry_size,
+          quote_reason,
+          entry_time_ms,
+          created_at_ms,
+          updated_at_ms
+        ) VALUES (
+          @positionId,
+          @positionId,
+          @conditionId,
+          @marketId,
+          @tokenId,
+          @marketName,
+          @symbol,
+          @leg,
+          @recurrence,
+          @schedulerTickId,
+          @schedulerCycleLabel,
+          @schedulerTickStartedMs,
+          @schedulerExpectedIntervalMs,
+          @schedulerActualIntervalMs,
+          @targetCycleStartMs,
+          @entryQuotePrice,
+          @entryFillPrice,
+          @entrySize,
+          @quoteReason,
+          @entryTimeMs,
+          @createdAtMs,
+          @updatedAtMs
+        )
+        ON CONFLICT(position_id) DO UPDATE SET
+          condition_id = excluded.condition_id,
+          market_id = excluded.market_id,
+          token_id = excluded.token_id,
+          market_name = excluded.market_name,
+          symbol = excluded.symbol,
+          leg = excluded.leg,
+          recurrence = excluded.recurrence,
+          scheduler_tick_id = excluded.scheduler_tick_id,
+          scheduler_cycle_label = excluded.scheduler_cycle_label,
+          scheduler_tick_started_ms = excluded.scheduler_tick_started_ms,
+          scheduler_expected_interval_ms = excluded.scheduler_expected_interval_ms,
+          scheduler_actual_interval_ms = excluded.scheduler_actual_interval_ms,
+          target_cycle_start_ms = excluded.target_cycle_start_ms,
+          entry_quote_price = excluded.entry_quote_price,
+          entry_fill_price = excluded.entry_fill_price,
+          entry_size = excluded.entry_size,
+          quote_reason = excluded.quote_reason,
+          entry_time_ms = excluded.entry_time_ms,
+          updated_at_ms = excluded.updated_at_ms
+      `)
+      .run({
+        ...input,
+        createdAtMs: now,
+        updatedAtMs: now,
+      });
+  }
+
+  finalizePaperTradeExit(input: FinalizePaperTradeExitInput): void {
+    this.db
+      .prepare(`
+        UPDATE paper_trades
+        SET
+          exit_quote_price = ?,
+          exit_fill_price = ?,
+          exit_size = ?,
+          exit_reason = ?,
+          exit_time_ms = ?,
+          holding_time_ms = ?,
+          realized_spread = ?,
+          realized_pnl = ?,
+          updated_at_ms = ?
+        WHERE position_id = ?
+      `)
+      .run(
+        input.exitQuotePrice,
+        input.exitFillPrice,
+        input.exitSize,
+        input.exitReason,
+        input.exitTimeMs,
+        input.holdingTimeMs ?? null,
+        input.realizedSpread ?? null,
+        input.realizedPnl ?? null,
+        Date.now(),
+        input.positionId,
+      );
+  }
+
+  finalizePaperSchedulerTick(tickId: string, completedAtMs: number): void {
+    this.db
+      .prepare(`
+        UPDATE paper_trades
+        SET scheduler_tick_completed_ms = ?, updated_at_ms = ?
+        WHERE scheduler_tick_id = ? AND scheduler_tick_completed_ms IS NULL
+      `)
+      .run(completedAtMs, Date.now(), tickId);
   }
 
   markExitReason(positionId: string, exitReason: string): void {

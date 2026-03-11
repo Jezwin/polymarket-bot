@@ -1,6 +1,6 @@
 import { env } from "../config/env.js";
 import { MarketDiscoveryService } from "../services/marketDiscovery.js";
-import { OrderService } from "../services/orderService.js";
+import { OrderService, type PaperTradeSchedulerContext } from "../services/orderService.js";
 import type { PositionManager } from "../services/positionManager.js";
 import type { CryptoSymbol, DiscoveredMarket } from "../types/market.js";
 import { logger } from "../utils/logger.js";
@@ -11,6 +11,7 @@ const REQUIRED_SYMBOLS: readonly CryptoSymbol[] = ["BTC", "ETH", "SOL", "XRP"];
 export class OrderScheduler {
   private intervalHandle?: NodeJS.Timeout;
   private tickInProgress = false;
+  private lastTickStartedMs?: number;
 
   // ─── 5-minute cycle state (original) ───
   private maxWalletStartTimeMs: number = 0;
@@ -72,13 +73,25 @@ export class OrderScheduler {
     }
 
     this.tickInProgress = true;
+    const tickStartedMs = Date.now();
+    const tickId = `scheduler:${tickStartedMs}`;
+    const actualIntervalMs =
+      this.lastTickStartedMs === undefined ? undefined : tickStartedMs - this.lastTickStartedMs;
+    this.lastTickStartedMs = tickStartedMs;
+    const tickContext: Omit<PaperTradeSchedulerContext, "cycleLabel" | "targetCycleStartMs"> = {
+      tickId,
+      schedulerTickStartedMs: tickStartedMs,
+      schedulerExpectedIntervalMs: env.MARKET_POLL_INTERVAL_SECONDS * 1_000,
+      schedulerActualIntervalMs: actualIntervalMs,
+    };
 
     try {
       const discoveredMarkets = await this.marketDiscoveryService.discoverMarkets();
-      const now = Date.now();
+      const now = tickStartedMs;
 
-      await this.process5mCycle(discoveredMarkets, now);
-      await this.process15mCycle(discoveredMarkets, now);
+      await this.positionManager?.manageOpenEntries(now);
+      await this.process5mCycle(discoveredMarkets, now, tickContext);
+      await this.process15mCycle(discoveredMarkets, now, tickContext);
       await this.positionManager?.manageOpenExits(now);
     } catch (error) {
       logger.error(
@@ -88,6 +101,7 @@ export class OrderScheduler {
         "Scheduler tick failed",
       );
     } finally {
+      this.orderService.completePaperTick(tickId, Date.now());
       this.tickInProgress = false;
     }
   }
@@ -95,7 +109,11 @@ export class OrderScheduler {
   // ═══════════════════════════════════════════════════════
   //  5-minute cycle (original logic, unchanged)
   // ═══════════════════════════════════════════════════════
-  private async process5mCycle(discoveredMarkets: DiscoveredMarket[], now: number): Promise<void> {
+  private async process5mCycle(
+    discoveredMarkets: DiscoveredMarket[],
+    now: number,
+    tickContext: Omit<PaperTradeSchedulerContext, "cycleLabel" | "targetCycleStartMs">,
+  ): Promise<void> {
     const currentSnapshotBucketMs = floorToFiveMinuteBucketUtc(now);
     const targetStartTimeMs = currentSnapshotBucketMs + env.STARTUP_MARKET_LOOKAHEAD_CYCLES * 5 * 60_000;
 
@@ -139,7 +157,11 @@ export class OrderScheduler {
 
       for (const market of unplacedMarkets) {
         try {
-          const placementResult = await this.orderService.placeOrdersForMarket(market);
+          const placementResult = await this.orderService.placeOrdersForMarket(market, {
+            ...tickContext,
+            cycleLabel: "5m",
+            targetCycleStartMs: targetStartTimeMs,
+          });
           const failedLegs = placementResult.legs.filter((leg) => leg.status === "failed");
 
           if (failedLegs.length === 0) {
@@ -236,7 +258,11 @@ export class OrderScheduler {
   // ═══════════════════════════════════════════════════════
   //  15-minute cycle (new, parallel pipeline)
   // ═══════════════════════════════════════════════════════
-  private async process15mCycle(discoveredMarkets: DiscoveredMarket[], now: number): Promise<void> {
+  private async process15mCycle(
+    discoveredMarkets: DiscoveredMarket[],
+    now: number,
+    tickContext: Omit<PaperTradeSchedulerContext, "cycleLabel" | "targetCycleStartMs">,
+  ): Promise<void> {
     const currentSnapshotBucketMs = floorToFifteenMinuteBucketUtc(now);
     const targetStartTimeMs = currentSnapshotBucketMs + env.FIFTEEN_MIN_LOOKAHEAD_CYCLES * 15 * 60_000;
 
@@ -282,7 +308,11 @@ export class OrderScheduler {
 
       for (const market of unplacedMarkets) {
         try {
-          const placementResult = await this.orderService.placeOrdersForMarket(market);
+          const placementResult = await this.orderService.placeOrdersForMarket(market, {
+            ...tickContext,
+            cycleLabel: "15m",
+            targetCycleStartMs: targetStartTimeMs,
+          });
           const failedLegs = placementResult.legs.filter((leg) => leg.status === "failed");
 
           if (failedLegs.length === 0) {

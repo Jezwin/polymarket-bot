@@ -59,7 +59,7 @@ const bootstrap = async (): Promise<void> => {
 
   await fillListener.connect();
 
-  const orderService = new OrderService(clobClientService, fillListener, positionManager, quoteEngine);
+  const orderService = new OrderService(clobClientService, fillListener, positionManager, quoteEngine, positionStore);
   positionManager.setOrderService(orderService);
 
   await positionManager.rehydrate(fillListener);

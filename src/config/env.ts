@@ -25,6 +25,7 @@ const envSchema = z.object({
   CHAIN_ID: z.coerce.number().int().default(137),
   ALCHEMY_WS_URL: z.string().url().default("wss://polygon-mainnet.g.alchemy.com/v2/4X-3b-IvrTq_9JAeVQW-M"),
   STATE_DB_PATH: z.string().trim().min(1).default("data/state.sqlite"),
+  DRY_RUN: z.coerce.boolean().default(false),
 
   MARKET_POLL_INTERVAL_SECONDS: z.coerce.number().int().positive().default(15),
   DISCOVERY_MARKET_LIMIT: z.coerce.number().int().positive().default(500),
